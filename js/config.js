@@ -1,5 +1,5 @@
 window.EXPERIMENT_CONFIG = {
-  API_BASE: "",
+  API_BASE: "https://xushisy-ehalvmnbmx.cn-hongkong.fcapp.run",
   ENDPOINTS: {
     randomize: "/api/randomize",
     chatStart: "/api/chat/start",
