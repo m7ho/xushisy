@@ -758,35 +758,6 @@ h3 {
   flex-direction: column;
 }
 
-.chat-empty {
-  display: grid;
-  max-width: 420px;
-  min-height: 340px;
-  margin: auto;
-  color: var(--ink-soft);
-  place-items: center;
-  text-align: center;
-}
-
-.chat-empty__mark {
-  display: grid;
-  width: 76px;
-  height: 76px;
-  margin: 0 auto 1.1rem;
-  border: 1px solid var(--teal-200);
-  border-radius: 28px;
-  place-items: center;
-  background: var(--teal-050);
-}
-
-.chat-empty__mark span {
-  display: block;
-  width: 30px;
-  height: 20px;
-  border: 2px solid var(--teal-700);
-  border-radius: 50%;
-}
-
 .message-list {
   display: grid;
   margin-top: auto;
@@ -1299,5 +1270,122 @@ h3 {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* 文字任务固定在可视区域内，仅中间的聊天或书写内容滚动。 */
+html.task-screen,
+body.task-screen {
+  height: 100dvh;
+  overflow: hidden;
+}
+.task-screen #app,
+.task-screen .shell {
+  height: 100%;
+  min-height: 0;
+}
+.task-screen .shell {
+  display: flex;
+  flex-direction: column;
+}
+.task-screen .site-header,
+.task-screen .progress-wrap {
+  flex-shrink: 0;
+}
+.task-screen .main {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  padding: 0.8rem 0;
+}
+.task-screen .workspace {
+  width: 100%;
+  min-height: 0;
+  overflow: hidden;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+}
+.task-notice {
+  display: flex;
+  padding: 0.55rem 1.25rem;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--ink-soft);
+  background: var(--teal-050);
+  font-size: 0.8rem;
+}
+.task-notice .button {
+  flex-shrink: 0;
+}
+.chat-body,
+.writing-body {
+  position: relative;
+  overscroll-behavior: contain;
+  overflow-y: auto;
+}
+.message-list {
+  flex-shrink: 0;
+  padding-bottom: 0.2rem;
+}
+.message__bubble {
+  overflow-wrap: anywhere;
+}
+.chat-controls {
+  display: flex;
+  margin-top: 0.35rem;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+.chat-controls .button {
+  min-height: 34px;
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+}
+.chat-controls #finish-chat {
+  margin-left: auto;
+}
+.message--incomplete .message__bubble {
+  opacity: 0.7;
+}
+[hidden] {
+  display: none !important;
+}
+@media (max-width: 640px), (max-height: 650px) {
+  .task-screen .site-header__inner {
+    min-height: 46px;
+  }
+  .task-screen .progress-wrap {
+    padding-top: 0.35rem;
+  }
+  .task-screen .progress-labels {
+    margin-top: 0.2rem;
+  }
+  .task-screen .main {
+    padding: 0.4rem 0;
+  }
+  .task-screen .workspace__header {
+    min-height: 60px;
+    padding: 0.55rem 0.8rem;
+    align-items: center;
+  }
+  .task-screen .workspace__actions {
+    flex-direction: row;
+    align-items: center;
+  }
+  .task-notice {
+    padding: 0.4rem 0.8rem;
+    font-size: 0.75rem;
+  }
+  .chat-composer {
+    padding: 0.6rem;
+  }
+  .composer-box textarea {
+    min-height: 40px;
+    max-height: 100px;
+  }
+  .chat-composer .error-note {
+    padding: 0.5rem;
+    margin: 0.4rem 0 0;
   }
 }

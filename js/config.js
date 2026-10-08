@@ -4,6 +4,8 @@ window.EXPERIMENT_CONFIG = {
     randomize: "/api/randomize",
     chatStart: "/api/chat/start",
     chatReply: "/api/chat",
+    chatStartStream: "/api/chat/start/stream",
+    chatReplyStream: "/api/chat/stream",
     event: "/api/event",
     measures: "/api/measures",
     complete: "/api/complete",
@@ -11,4 +13,3 @@ window.EXPERIMENT_CONFIG = {
   TASK_DURATION_SECONDS: 12 * 60,
   ENABLE_LOCAL_PREVIEW: true,
 };
-// Pages redeploy 2026-10-06

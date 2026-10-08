@@ -4,6 +4,7 @@
   const config = window.EXPERIMENT_CONFIG || {};
   const app = document.getElementById("app");
   const exitDialog = document.getElementById("exit-dialog");
+  const taskDialog = document.getElementById("task-dialog");
 
   const bsriItems = [
     "此时此刻，我反复思虑自己的负面情绪。",
@@ -53,6 +54,13 @@
     messages: [],
     writing: {},
     timerId: null,
+    taskDeadline: null,
+    taskStartedAt: null,
+    taskExpired: false,
+    chatBusy: false,
+    pendingChat: null,
+    chatController: null,
+    taskTiming: {},
     secondsRemaining: Number(config.TASK_DURATION_SECONDS) || 720,
     previewMode: false,
   };
@@ -151,6 +159,9 @@
   function renderShell(content, options = {}) {
     const { home = false, hideProgress = false, participant = true } = options;
     const stage = screenStage[state.currentScreen] || 1;
+    const taskScreen = ["chat", "writing"].includes(state.currentScreen);
+    document.body.classList.toggle("task-screen", taskScreen);
+    document.documentElement.classList.toggle("task-screen", taskScreen);
     app.innerHTML = `
       <div class="shell">
         ${renderHeader(participant)}
@@ -173,6 +184,8 @@
 
   function navigate(screen) {
     clearTaskTimer();
+    state.chatController?.abort();
+    taskDialog.close();
     state.currentScreen = screen;
     renderCurrentScreen();
   }
@@ -632,7 +645,14 @@
   }
 
   function timerMarkup() {
-    return `<span class="time-pill" aria-live="polite">剩余时间 <strong id="task-timer">12:00</strong></span>`;
+    return `<span class="time-pill">剩余时间 <strong id="task-timer">${formatTime(Number(config.TASK_DURATION_SECONDS) || 720)}</strong></span>`;
+  }
+
+  function taskNoticeMarkup() {
+    return `<div class="task-notice" id="task-notice" role="status">
+      <span id="task-notice-text">本次任务为 12 分钟，结束前会提醒你。</span>
+      <button class="button button--ghost" type="button" id="go-posttest" hidden>进入后测</button>
+    </div>`;
   }
 
   function formatTime(totalSeconds) {
@@ -641,18 +661,38 @@
     return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
 
+  function remainingSeconds() {
+    return state.taskDeadline === null
+      ? Number(config.TASK_DURATION_SECONDS) || 720
+      : Math.max(0, Math.ceil((state.taskDeadline - Date.now()) / 1000));
+  }
+
   function startTaskTimer() {
-    clearTaskTimer();
-    state.secondsRemaining = Number(config.TASK_DURATION_SECONDS) || 720;
+    if (state.taskDeadline !== null) return;
+    state.taskStartedAt = Date.now();
+    state.taskDeadline = state.taskStartedAt + (Number(config.TASK_DURATION_SECONDS) || 720) * 1000;
+    state.taskExpired = false;
+    state.taskTiming.startedAt = new Date(state.taskStartedAt).toISOString();
+    state.taskTiming.plannedSeconds = Number(config.TASK_DURATION_SECONDS) || 720;
+    updateTaskTimer();
+    state.timerId = window.setInterval(updateTaskTimer, 250);
+  }
+
+  function updateTaskTimer() {
+    if (!["chat", "writing"].includes(state.currentScreen) || state.taskDeadline === null) return;
+    state.secondsRemaining = remainingSeconds();
     const timer = document.getElementById("task-timer");
     if (timer) timer.textContent = formatTime(state.secondsRemaining);
-
-    state.timerId = window.setInterval(() => {
-      state.secondsRemaining -= 1;
-      const currentTimer = document.getElementById("task-timer");
-      if (currentTimer) currentTimer.textContent = formatTime(Math.max(0, state.secondsRemaining));
-      if (state.secondsRemaining <= 0) finishTask();
-    }, 1000);
+    const text = document.getElementById("task-notice-text");
+    if (state.secondsRemaining === 0) {
+      expireTask();
+    } else if (state.secondsRemaining <= 30) {
+      const notice = "还剩不到半分钟，可以把正在表达的这一点留在这里。到时会由你确认进入后测。";
+      if (text.textContent !== notice) text.textContent = notice;
+    } else if (state.secondsRemaining <= 120) {
+      const notice = "本次任务还剩不到两分钟。你可以慢慢收束，写下此刻希望留下的一点，不需要把所有问题都解决。";
+      if (text.textContent !== notice) text.textContent = notice;
+    }
   }
 
   function clearTaskTimer() {
@@ -660,6 +700,44 @@
       window.clearInterval(state.timerId);
       state.timerId = null;
     }
+  }
+
+  function captureTaskDrafts() {
+    document.querySelectorAll(".writing-input").forEach((input) => {
+      state.writing[input.id] = input.value;
+    });
+    const input = document.getElementById("chat-input");
+    if (input?.value.trim()) state.taskTiming.unsentDraft = input.value.trim();
+  }
+
+  function expireTask() {
+    if (state.taskExpired) return;
+    state.taskExpired = true;
+    clearTaskTimer();
+    captureTaskDrafts();
+    state.taskTiming.endedAt = new Date(state.taskDeadline).toISOString();
+    state.taskTiming.actualSeconds = state.taskTiming.plannedSeconds;
+    state.taskTiming.endReason = "time_limit";
+    state.chatController?.abort();
+    setChatEnabled(false);
+    document.querySelectorAll(".writing-input").forEach((input) => { input.disabled = true; });
+    const retry = document.getElementById("retry-chat");
+    if (retry) retry.hidden = true;
+    document.getElementById("task-notice-text").textContent = "12 分钟的文字任务已结束。内容保留在这里，准备好后请进入后测；尚未说完也没有关系。";
+    const postButton = document.getElementById("go-posttest");
+    postButton.hidden = false;
+    postButton.onclick = finishTask;
+    showTaskEndDialog(true);
+  }
+
+  function showTaskEndDialog(expired = false) {
+    document.getElementById("task-dialog-title").textContent = expired ? "本次文字任务已到时间" : "准备结束文字任务了吗？";
+    document.getElementById("task-dialog-text").textContent = expired
+      ? "本次任务为 12 分钟，你的内容仍保留在当前会话中。无需解决所有问题或形成某种结论。你可以先查看刚才的内容，准备好后进入后测；如有不适，可退出并联系现场研究者。"
+      : "你可以现在结束并进入后测，也可以回到任务继续表达。";
+    document.getElementById("task-dialog-back").textContent = expired ? "查看刚才内容" : "继续任务";
+    if (exitDialog.open) exitDialog.close();
+    if (!taskDialog.open) taskDialog.showModal();
   }
 
   function renderChat() {
@@ -675,15 +753,9 @@
             <button class="button button--ghost" type="button" data-exit>退出</button>
           </div>
         </header>
+        ${taskNoticeMarkup()}
         <div class="workspace__body chat-body" id="chat-body">
-          <div class="chat-empty" id="chat-empty">
-            <div>
-              <div class="chat-empty__mark" aria-hidden="true"><span></span></div>
-              <h3>正在连接文字对话</h3>
-              <p id="chat-empty-text">第一条引导将由大模型实时生成，页面不会使用预设回复。</p>
-            </div>
-          </div>
-          <div class="message-list" id="message-list" aria-live="polite"></div>
+          <div class="message-list" id="message-list" aria-live="polite" aria-relevant="additions"></div>
         </div>
         <footer class="chat-composer">
           <form id="chat-form">
@@ -699,13 +771,13 @@
             <p class="composer-hint">Enter 发送，Shift + Enter 换行。请勿填写真实姓名或联系方式。</p>
             <p class="error-note" id="chat-error"></p>
           </form>
+          <div class="chat-controls">
+            <button class="button button--secondary" type="button" id="retry-chat" hidden>重试这条消息</button>
+            <button class="button button--ghost" type="button" id="finish-chat">结束文字任务</button>
+          </div>
         </footer>
       </section>
-      <div class="button-row">
-        <button class="button button--secondary" type="button" id="finish-chat">提前完成任务</button>
-      </div>
     `);
-
     bindExitButtons();
     bindChatEvents();
     beginAiSession();
@@ -715,127 +787,208 @@
     const input = document.getElementById("chat-input");
     input.addEventListener("input", () => {
       input.style.height = "auto";
-      input.style.height = `${Math.min(input.scrollHeight, 130)}px`;
+      input.style.height = `${Math.min(input.scrollHeight, 100)}px`;
     });
     input.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && !event.shiftKey) {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
         document.getElementById("chat-form").requestSubmit();
       }
     });
     document.getElementById("chat-form").addEventListener("submit", sendChatMessage);
-    document.getElementById("finish-chat").addEventListener("click", finishTask);
+    document.getElementById("finish-chat").addEventListener("click", () => showTaskEndDialog(state.taskExpired));
+    document.getElementById("retry-chat").addEventListener("click", requestChatReply);
   }
 
   function setChatEnabled(enabled) {
     const input = document.getElementById("chat-input");
     const button = document.querySelector(".send-button");
     if (!input || !button) return;
-    input.disabled = !enabled;
-    button.disabled = !enabled;
-    if (enabled) input.focus();
+    const canSend = enabled && !state.taskExpired && !state.chatBusy && !state.pendingChat;
+    input.disabled = !canSend;
+    button.disabled = !canSend;
+    if (canSend) input.focus();
+  }
+
+  function scrollChatToBottom() {
+    const body = document.getElementById("chat-body");
+    if (body) body.scrollTop = body.scrollHeight;
   }
 
   function appendMessage(role, text) {
-    const empty = document.getElementById("chat-empty");
-    if (empty) empty.hidden = true;
-
     const list = document.getElementById("message-list");
     const message = document.createElement("article");
     message.className = `message message--${role}`;
     const bubble = document.createElement("div");
     bubble.className = "message__bubble";
     bubble.textContent = text;
-    const meta = document.createElement("span");
-    meta.className = "message__meta";
-    meta.textContent = role === "user" ? "你" : "文字助手";
-    message.append(bubble, meta);
+    message.append(bubble);
+    if (role === "user") {
+      const meta = document.createElement("span");
+      meta.className = "message__meta";
+      meta.textContent = "你";
+      message.append(meta);
+    }
     list.append(message);
-    document.getElementById("chat-body").scrollTop = document.getElementById("chat-body").scrollHeight;
+    scrollChatToBottom();
+    return message;
   }
 
   function appendThinking() {
-    const empty = document.getElementById("chat-empty");
-    if (empty) empty.hidden = true;
-    const list = document.getElementById("message-list");
-    const wrapper = document.createElement("article");
-    wrapper.className = "message message--assistant";
+    const wrapper = appendMessage("assistant", "");
     wrapper.id = "thinking-message";
-    wrapper.innerHTML = `
-      <div class="message__bubble">
-        <span class="thinking" aria-label="正在生成回复">
-          <span></span><span></span><span></span>
-        </span>
-      </div>
-      <span class="message__meta">正在生成回复</span>
-    `;
-    list.append(wrapper);
+    wrapper.querySelector(".message__bubble").innerHTML = `
+      <span class="thinking" aria-label="正在生成回复"><span></span><span></span><span></span></span>`;
+    return wrapper;
   }
 
-  function removeThinking() {
-    document.getElementById("thinking-message")?.remove();
+  async function streamChatRequest(endpoint, payload, onDelta, signal) {
+    const response = await fetch(apiUrl(endpoint), {
+      method: "POST", headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: JSON.stringify(payload), signal,
+    });
+    if (!response.ok) {
+      let detail;
+      try { detail = (await response.json()).error; } catch (_) {}
+      const error = new Error(detail?.message || `请求失败 ${response.status}`);
+      error.requestId = response.headers.get("X-Request-ID");
+      throw error;
+    }
+    if (!response.headers.get("Content-Type")?.includes("text/event-stream") || !response.body) {
+      throw new Error("当前后端尚未支持流式对话，请联系现场研究者更新后端。");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result = null;
+    function consume(frame) {
+      let event = "message";
+      const data = [];
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+      }
+      if (!data.length) return;
+      const parsed = JSON.parse(data.join("\n"));
+      if (event === "delta") onDelta(parsed.text || "");
+      if (event === "done") result = parsed;
+      if (event === "error") {
+        const error = new Error(parsed.message);
+        error.requestId = parsed.requestId;
+        throw error;
+      }
+    }
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        buffer = buffer.replace(/\r\n/g, "\n");
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          consume(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) consume(buffer);
+      if (!result?.reply || typeof result.reply !== "string") throw new Error("回复传输中断，请重试原消息。");
+      return result;
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
   }
 
   async function beginAiSession() {
-    if (isLocalPreview() && !config.API_BASE) {
-      const text = document.getElementById("chat-empty-text");
-      text.textContent = "前端页面已经准备好。连接后端模型接口后，第一条引导会在这里实时生成。";
-      showError("当前为本地前端预览，尚未连接大模型接口。", "chat-error");
+    if (state.previewMode || (isLocalPreview() && !config.API_BASE)) {
+      showError("当前为界面预览，请从首页使用研究者提供的编号开始完整流程。", "chat-error");
       return;
     }
-
-    appendThinking();
-    try {
-      const result = await apiRequest(config.ENDPOINTS.chatStart, {
-        participantId: state.participantId,
-        event: state.event,
-      });
-      if (!result.reply || typeof result.reply !== "string") {
-        throw new Error("模型回复为空");
-      }
-      removeThinking();
-      state.messages.push({ role: "assistant", content: result.reply });
-      appendMessage("assistant", result.reply);
-      setChatEnabled(true);
-      startTaskTimer();
-    } catch (error) {
-      removeThinking();
-      showError("暂时无法连接文字对话，请检查网络或联系现场研究者。", "chat-error");
-    }
+    state.pendingChat = { start: true };
+    await requestChatReply();
   }
 
   async function sendChatMessage(event) {
     event.preventDefault();
+    if (state.chatBusy || state.pendingChat || state.taskExpired) return;
+    if (remainingSeconds() === 0) { expireTask(); return; }
     const input = document.getElementById("chat-input");
     const content = input.value.trim();
     if (!content) return;
-
-    const chatError = document.getElementById("chat-error");
-    chatError.classList.remove("is-visible");
     input.value = "";
     input.style.height = "auto";
     state.messages.push({ role: "user", content });
     appendMessage("user", content);
-    setChatEnabled(false);
-    appendThinking();
+    state.pendingChat = { start: false, turnNumber: state.messages.filter((message) => message.role === "user").length };
+    await requestChatReply();
+  }
 
+  async function requestChatReply() {
+    if (state.chatBusy || state.taskExpired || !state.pendingChat || state.currentScreen !== "chat") return;
+    if (remainingSeconds() === 0) { expireTask(); return; }
+    state.chatBusy = true;
+    setChatEnabled(false);
+    const retry = document.getElementById("retry-chat");
+    retry.hidden = true;
+    document.getElementById("chat-error").classList.remove("is-visible");
+    state.pendingChat.messageElement?.remove();
+    const message = appendThinking();
+    state.pendingChat.messageElement = message;
+    let streamedText = "";
+    const controller = new AbortController();
+    state.chatController = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 210000);
     try {
-      const result = await apiRequest(config.ENDPOINTS.chatReply, {
-        participantId: state.participantId,
-        event: state.event,
-        messages: state.messages,
-      });
-      if (!result.reply || typeof result.reply !== "string") {
-        throw new Error("模型回复为空");
+      const start = state.pendingChat.start;
+      const payload = { participantId: state.participantId, event: state.event, secondsRemaining: remainingSeconds() };
+      if (!start) {
+        payload.messages = state.messages.slice(-30);
+        payload.turnNumber = state.pendingChat.turnNumber;
       }
-      removeThinking();
+      const result = await streamChatRequest(
+        start ? config.ENDPOINTS.chatStartStream : config.ENDPOINTS.chatReplyStream,
+        payload,
+        (delta) => {
+          if (state.currentScreen !== "chat" || state.taskExpired) return;
+          if (state.taskDeadline !== null && remainingSeconds() === 0) { expireTask(); return; }
+          const body = document.getElementById("chat-body");
+          const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 90;
+          streamedText += delta;
+          message.querySelector(".message__bubble").textContent = streamedText;
+          if (nearBottom) scrollChatToBottom();
+        },
+        controller.signal,
+      );
+      if (state.currentScreen !== "chat" || state.taskExpired) return;
+      if (state.taskDeadline !== null && remainingSeconds() === 0) { expireTask(); return; }
+      message.removeAttribute("id");
+      message.querySelector(".message__bubble").textContent = result.reply;
       state.messages.push({ role: "assistant", content: result.reply });
-      appendMessage("assistant", result.reply);
-      setChatEnabled(true);
+      state.pendingChat = null;
+      if (result.action === "stop") {
+        state.taskTiming.endReason = "safety_stop";
+        navigate("support");
+        return;
+      }
+      if (start) startTaskTimer();
     } catch (error) {
-      removeThinking();
-      showError("回复生成失败。请稍后重试，或联系现场研究者。你刚才的输入仍保留在当前页面中。", "chat-error");
-      setChatEnabled(true);
+      if (!streamedText) message.remove();
+      else {
+        message.classList.add("message--incomplete");
+        const note = document.createElement("span");
+        note.className = "message__meta";
+        note.textContent = state.taskExpired ? "任务到时，回复已暂停" : "回复未完整生成";
+        message.append(note);
+      }
+      if (state.currentScreen !== "chat" || state.taskExpired) return;
+      const reference = error.requestId ? `（错误编号 ${error.requestId}）` : "";
+      showError(`这条回复未能完成。你的输入已保留，点击“重试这条消息”即可，无需重复输入。${reference}`, "chat-error");
+      retry.hidden = false;
+    } finally {
+      window.clearTimeout(timeout);
+      if (state.chatController === controller) state.chatController = null;
+      state.chatBusy = false;
+      if (state.currentScreen === "chat") setChatEnabled(true);
     }
   }
 
@@ -875,6 +1028,7 @@
             <button class="button button--ghost" type="button" data-exit>退出</button>
           </div>
         </header>
+        ${taskNoticeMarkup()}
         <div class="workspace__body writing-body">
           <p class="writing-intro">请按自己的节奏完成四段文字记录。每一部分篇幅不限，也可以返回修改。页面不会评价、解释或回应你写下的内容。</p>
           <div class="writing-grid">
@@ -902,7 +1056,7 @@
         </div>
         <footer class="workspace__footer">
           <span class="form-hint">请勿填写真实姓名、学校、地址或联系方式。</span>
-          <button class="button button--primary" type="button" id="finish-writing">完成记录</button>
+          <button class="button button--primary" type="button" id="finish-writing">结束文字任务</button>
         </footer>
       </section>
     `);
@@ -924,13 +1078,21 @@
       document.querySelectorAll(".writing-input").forEach((input) => {
         state.writing[input.id] = input.value;
       });
-      finishTask();
+      showTaskEndDialog(state.taskExpired);
     });
     startTaskTimer();
   }
 
   function finishTask() {
+    captureTaskDrafts();
     clearTaskTimer();
+    if (!state.taskTiming.endedAt) {
+      state.taskTiming.endedAt = new Date().toISOString();
+      state.taskTiming.actualSeconds = state.taskStartedAt === null ? 0 : Math.round((Date.now() - state.taskStartedAt) / 1000);
+      state.taskTiming.endReason = "participant_finished";
+    }
+    state.taskTiming.posttestStartedAt = new Date().toISOString();
+    state.posttest.taskTiming = { ...state.taskTiming };
     navigate("bsri-post");
   }
 
@@ -1154,6 +1316,11 @@
   }
 
   function bindDialog() {
+    document.getElementById("task-dialog-back").addEventListener("click", () => taskDialog.close());
+    document.getElementById("task-dialog-confirm").addEventListener("click", finishTask);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) updateTaskTimer();
+    });
     exitDialog.querySelector("[data-dialog-close]").addEventListener("click", () => exitDialog.close());
     exitDialog.querySelector("[data-confirm-exit]").addEventListener("click", () => {
       exitDialog.close();

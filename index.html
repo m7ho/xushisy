@@ -10,7 +10,7 @@
     <meta name="theme-color" content="#123f46" />
     <title>近期事件回忆与文字表达研究</title>
     <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
-    <link rel="stylesheet" href="css/styles.css" />
+    <link rel="stylesheet" href="css/styles.css?v=20261008" />
   </head>
   <body>
     <noscript>
@@ -37,7 +37,18 @@
       </div>
     </dialog>
 
-    <script src="js/config.js"></script>
-    <script src="js/app.js"></script>
+    <dialog id="task-dialog" class="dialog" aria-labelledby="task-dialog-title">
+      <div class="dialog__body">
+        <h2 id="task-dialog-title">准备结束文字任务了吗？</h2>
+        <p id="task-dialog-text"></p>
+        <div class="dialog__actions">
+          <button class="button button--ghost" type="button" id="task-dialog-back">继续任务</button>
+          <button class="button button--primary" type="button" id="task-dialog-confirm">进入后测</button>
+        </div>
+      </div>
+    </dialog>
+
+    <script src="js/config.js?v=20261008"></script>
+    <script src="js/app.js?v=20261008"></script>
   </body>
 </html>
