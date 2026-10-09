@@ -63,7 +63,95 @@
     taskTiming: {},
     secondsRemaining: Number(config.TASK_DURATION_SECONDS) || 720,
     previewMode: false,
+    formDrafts: {},
+    chatDraft: "",
+    submitted: false,
+    storageAvailable: true,
   };
+
+  const SESSION_KEY = "xushisy.session.v3";
+  const SESSION_TTL = 24 * 60 * 60 * 1000;
+  let recoverySnapshot = null;
+  let earlyEndStep = 0;
+
+  function clearSession() {
+    try { window.localStorage.removeItem(SESSION_KEY); } catch (_) { /* 存储不可用 */ }
+  }
+
+  function persistSession() {
+    if (state.previewMode || recoverySnapshot || !state.participantId || state.submitted) return;
+    captureTaskDrafts();
+    const fields = [...app.querySelectorAll("input, textarea, select")]
+      .filter((input) => input.id || input.name)
+      .map((input) => ({ id: input.id, name: input.name, value: input.value,
+        checked: input.checked, touched: input.dataset.touched }));
+    state.formDrafts[state.currentScreen] = fields;
+    const saved = {};
+    ["participantId", "currentScreen", "condition", "event", "pretest", "posttest",
+      "messages", "writing", "taskDeadline", "taskStartedAt", "taskExpired", "taskTiming",
+      "formDrafts", "chatDraft"].forEach((key) => { saved[key] = state[key]; });
+    saved.pendingChat = state.pendingChat ? { start: state.pendingChat.start, turnNumber: state.pendingChat.turnNumber } : null;
+    try {
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify({ version: 3, savedAt: Date.now(), state: saved }));
+      state.storageAvailable = true;
+    } catch (_) {
+      state.storageAvailable = false;
+      const text = document.getElementById("task-notice-text");
+      if (text) text.textContent = "浏览器暂存不可用。请保持页面打开；需要离开时联系现场研究者。";
+    }
+  }
+
+  function loadSession() {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(SESSION_KEY));
+      if (!saved) return null;
+      if (saved.version !== 3 || !Number.isFinite(saved.savedAt) || Date.now() - saved.savedAt > SESSION_TTL ||
+          !saved.state?.participantId || !screenStage[saved.state.currentScreen] ||
+          !Array.isArray(saved.state.messages) || !saved.state.formDrafts ||
+          (saved.state.taskDeadline !== null && !Number.isFinite(saved.state.taskDeadline))) {
+        clearSession(); return null;
+      }
+      return saved;
+    } catch (_) { clearSession(); return null; }
+  }
+
+  function restoreFormDrafts() {
+    (state.formDrafts[state.currentScreen] || []).forEach((field) => {
+      const inputs = field.id ? [document.getElementById(field.id)] :
+        [...app.querySelectorAll("input")].filter((input) => input.name === field.name && input.value === field.value);
+      inputs.filter(Boolean).forEach((input) => {
+        if (input.type === "radio" || input.type === "checkbox") input.checked = Boolean(field.checked);
+        else input.value = field.value;
+        if (input.type === "range" && field.touched === "true") {
+          input.dataset.touched = "true";
+          const output = document.getElementById(`${input.id}-value`);
+          if (output) { output.dataset.empty = "false"; output.textContent = input.value; output.value = input.value; }
+        }
+      });
+    });
+  }
+
+  function renderRecovery() {
+    renderShell(`<section class="completion"><div class="completion-card">
+      <p class="eyebrow">发现未完成的实验</p><h2>可以从离开的地方继续</h2>
+      <p>本浏览器保存了参与者编号 ${escapeHtml(recoverySnapshot.state.participantId)} 的进度。</p>
+      <p>文字任务的计时会继续按原定截止时间计算，离开页面不会暂停或重置计时。若已到时间，将保留内容并进入结束确认。</p>
+      <p>请由这位参与者继续操作。如果不是同一位参与者，或误点了确认退出，请先联系现场研究者。</p>
+      <button class="button button--primary" type="button" id="resume-session">恢复原来的进度</button>
+    </div></section>`, { hideProgress: true, participant: false });
+    document.getElementById("resume-session").onclick = () => {
+      const savedAt = recoverySnapshot.savedAt;
+      Object.assign(state, recoverySnapshot.state);
+      recoverySnapshot = null;
+      state.chatBusy = false;
+      state.chatController = null;
+      state.taskTiming.recoveries = [...(state.taskTiming.recoveries || []), {
+        resumedAt: new Date().toISOString(), lastSavedAt: new Date(savedAt).toISOString(),
+        remainingSeconds: remainingSeconds(),
+      }];
+      renderCurrentScreen();
+    };
+  }
 
   const screenStage = {
     consent: 1,
@@ -183,6 +271,15 @@
   }
 
   function navigate(screen) {
+    if (["chat", "writing"].includes(state.currentScreen) && ["support", "withdrawn"].includes(screen)) {
+      captureTaskDrafts();
+      if (state.taskStartedAt !== null && !state.taskTiming.endedAt) {
+        state.taskTiming.endedAt = new Date().toISOString();
+        state.taskTiming.actualSeconds = Math.min(state.taskTiming.plannedSeconds, Math.round((Date.now() - state.taskStartedAt) / 1000));
+        state.taskTiming.endReason = state.taskTiming.endReason || (screen === "support" ? "support_requested" : "withdrawn");
+      }
+    }
+    persistSession();
     clearTaskTimer();
     state.chatController?.abort();
     taskDialog.close();
@@ -407,7 +504,7 @@
             <p class="error-note" id="page-error"></p>
             <div class="button-row">
               <button class="button button--primary" type="submit">进入前测问卷</button>
-              <button class="button button--ghost" type="button" data-exit>暂时退出</button>
+              <button class="button button--ghost" type="button" data-exit>退出实验</button>
             </div>
           </div>
         </form>
@@ -512,7 +609,7 @@
           <p class="error-note" id="bsri-error"></p>
           <div class="button-row">
             <button class="button button--primary" type="submit">继续</button>
-            <button class="button button--ghost" type="button" data-exit>暂时退出</button>
+            <button class="button button--ghost" type="button" data-exit>退出实验</button>
           </div>
         </div>
       </form>
@@ -571,7 +668,7 @@
             <p class="error-note" id="event-measures-error"></p>
             <div class="button-row">
               <button class="button button--primary" type="submit">${isPre ? "开始文字任务" : "继续"}</button>
-              <button class="button button--ghost" type="button" data-exit>暂时退出</button>
+              <button class="button button--ghost" type="button" data-exit>退出实验</button>
             </div>
           </div>
         </form>
@@ -645,12 +742,12 @@
   }
 
   function timerMarkup() {
-    return `<span class="time-pill">剩余时间 <strong id="task-timer">${formatTime(Number(config.TASK_DURATION_SECONDS) || 720)}</strong></span>`;
+    return `<span class="time-pill">剩余时间 <strong id="task-timer">${formatTime(remainingSeconds())}</strong></span>`;
   }
 
   function taskNoticeMarkup() {
     return `<div class="task-notice" id="task-notice" role="status">
-      <span id="task-notice-text">本次任务为 12 分钟，结束前会提醒你。</span>
+      <span id="task-notice-text">本次任务为 12 分钟，结束前会提醒。内容自动暂存于本浏览器，误关闭后可恢复进度。</span>
       <button class="button button--ghost" type="button" id="go-posttest" hidden>进入后测</button>
     </div>`;
   }
@@ -668,14 +765,17 @@
   }
 
   function startTaskTimer() {
-    if (state.taskDeadline !== null) return;
-    state.taskStartedAt = Date.now();
-    state.taskDeadline = state.taskStartedAt + (Number(config.TASK_DURATION_SECONDS) || 720) * 1000;
+    clearTaskTimer();
+    if (state.taskDeadline === null) {
+      state.taskStartedAt = Date.now();
+      state.taskDeadline = state.taskStartedAt + (Number(config.TASK_DURATION_SECONDS) || 720) * 1000;
+      state.taskTiming.startedAt = new Date(state.taskStartedAt).toISOString();
+      state.taskTiming.plannedSeconds = Number(config.TASK_DURATION_SECONDS) || 720;
+    }
     state.taskExpired = false;
-    state.taskTiming.startedAt = new Date(state.taskStartedAt).toISOString();
-    state.taskTiming.plannedSeconds = Number(config.TASK_DURATION_SECONDS) || 720;
     updateTaskTimer();
-    state.timerId = window.setInterval(updateTaskTimer, 250);
+    if (!state.taskExpired) state.timerId = window.setInterval(updateTaskTimer, 250);
+    persistSession();
   }
 
   function updateTaskTimer() {
@@ -687,10 +787,12 @@
     if (state.secondsRemaining === 0) {
       expireTask();
     } else if (state.secondsRemaining <= 30) {
-      const notice = "还剩不到半分钟，可以把正在表达的这一点留在这里。到时会由你确认进入后测。";
+      document.getElementById("task-notice").dataset.phase = "last-seconds";
+      const notice = "时间提醒 · 还剩 30 秒以内。可以继续表达正在说的这一点；到时内容会保存，由你确认进入后测。";
       if (text.textContent !== notice) text.textContent = notice;
     } else if (state.secondsRemaining <= 120) {
-      const notice = "本次任务还剩不到两分钟。你可以慢慢收束，写下此刻希望留下的一点，不需要把所有问题都解决。";
+      document.getElementById("task-notice").dataset.phase = "closing";
+      const notice = "时间提醒 · 还剩 2 分钟以内。继续当前这一点即可，不需要现在得出结论；到时会再次提醒。";
       if (text.textContent !== notice) text.textContent = notice;
     }
   }
@@ -707,6 +809,7 @@
       state.writing[input.id] = input.value;
     });
     const input = document.getElementById("chat-input");
+    if (input) state.chatDraft = input.value;
     if (input?.value.trim()) state.taskTiming.unsentDraft = input.value.trim();
   }
 
@@ -723,18 +826,30 @@
     document.querySelectorAll(".writing-input").forEach((input) => { input.disabled = true; });
     const retry = document.getElementById("retry-chat");
     if (retry) retry.hidden = true;
-    document.getElementById("task-notice-text").textContent = "12 分钟的文字任务已结束。内容保留在这里，准备好后请进入后测；尚未说完也没有关系。";
+    ["finish-chat", "finish-writing"].forEach((id) => {
+      const button = document.getElementById(id);
+      if (button) button.textContent = "进入后测";
+    });
+    document.getElementById("task-notice").dataset.phase = "ended";
+    document.getElementById("task-notice-text").textContent = "本次文字任务已到时间，你的内容已暂存。准备好后进入后测；若仍想表达或感到不适，请告诉现场研究者。";
     const postButton = document.getElementById("go-posttest");
     postButton.hidden = false;
     postButton.onclick = finishTask;
     showTaskEndDialog(true);
+    persistSession();
   }
 
   function showTaskEndDialog(expired = false) {
-    document.getElementById("task-dialog-title").textContent = expired ? "本次文字任务已到时间" : "准备结束文字任务了吗？";
+    earlyEndStep = 0;
+    document.getElementById("task-dialog-check-wrap").hidden = true;
+    document.getElementById("task-dialog-check").checked = false;
+    document.getElementById("task-dialog-support").hidden = !expired;
+    document.getElementById("task-dialog-confirm").disabled = false;
+    document.getElementById("task-dialog-confirm").textContent = expired ? "进入后测" : "下一步确认";
+    document.getElementById("task-dialog-title").textContent = expired ? "本次文字任务已到时间" : "准备提前结束文字任务吗？";
     document.getElementById("task-dialog-text").textContent = expired
-      ? "本次任务为 12 分钟，你的内容仍保留在当前会话中。无需解决所有问题或形成某种结论。你可以先查看刚才的内容，准备好后进入后测；如有不适，可退出并联系现场研究者。"
-      : "你可以现在结束并进入后测，也可以回到任务继续表达。";
+      ? "本次任务的内容已暂存。尚未说完的部分不需要强行得出结论。如果你仍想表达，或这次回忆让你更难受，请告诉现场研究者。你可以先查看刚才的内容，再确认进入后测。"
+      : "提前结束会停止本次文字任务并进入后测，之后不能返回继续任务。你也可以取消，继续表达。";
     document.getElementById("task-dialog-back").textContent = expired ? "查看刚才内容" : "继续任务";
     if (exitDialog.open) exitDialog.close();
     if (!taskDialog.open) taskDialog.showModal();
@@ -750,7 +865,7 @@
           </div>
           <div class="workspace__actions">
             ${timerMarkup()}
-            <button class="button button--ghost" type="button" data-exit>退出</button>
+            <button class="button button--ghost" type="button" data-exit>退出实验</button>
           </div>
         </header>
         ${taskNoticeMarkup()}
@@ -773,14 +888,22 @@
           </form>
           <div class="chat-controls">
             <button class="button button--secondary" type="button" id="retry-chat" hidden>重试这条消息</button>
-            <button class="button button--ghost" type="button" id="finish-chat">结束文字任务</button>
+            <button class="button button--ghost" type="button" id="finish-chat">提前结束文字任务</button>
           </div>
         </footer>
       </section>
     `);
     bindExitButtons();
     bindChatEvents();
-    beginAiSession();
+    state.messages.forEach((message) => appendMessage(message.role, message.content));
+    document.getElementById("chat-input").value = state.chatDraft;
+    if (state.taskDeadline !== null) startTaskTimer();
+    if (state.taskExpired) return;
+    if (state.pendingChat) {
+      showError("离开前有一条回复尚未完成。你的输入已保留，可以点击重试继续。", "chat-error");
+      document.getElementById("retry-chat").hidden = false;
+    } else if (state.messages.length) setChatEnabled(true);
+    else beginAiSession();
   }
 
   function bindChatEvents() {
@@ -927,6 +1050,7 @@
     if (state.chatBusy || state.taskExpired || !state.pendingChat || state.currentScreen !== "chat") return;
     if (remainingSeconds() === 0) { expireTask(); return; }
     state.chatBusy = true;
+    persistSession();
     setChatEnabled(false);
     const retry = document.getElementById("retry-chat");
     retry.hidden = true;
@@ -965,6 +1089,7 @@
       message.querySelector(".message__bubble").textContent = result.reply;
       state.messages.push({ role: "assistant", content: result.reply });
       state.pendingChat = null;
+      persistSession();
       if (result.action === "stop") {
         state.taskTiming.endReason = "safety_stop";
         navigate("support");
@@ -1025,7 +1150,7 @@
           </div>
           <div class="workspace__actions">
             ${timerMarkup()}
-            <button class="button button--ghost" type="button" data-exit>退出</button>
+            <button class="button button--ghost" type="button" data-exit>退出实验</button>
           </div>
         </header>
         ${taskNoticeMarkup()}
@@ -1056,13 +1181,14 @@
         </div>
         <footer class="workspace__footer">
           <span class="form-hint">请勿填写真实姓名、学校、地址或联系方式。</span>
-          <button class="button button--primary" type="button" id="finish-writing">结束文字任务</button>
+          <button class="button button--primary" type="button" id="finish-writing">提前结束文字任务</button>
         </footer>
       </section>
     `);
 
     bindExitButtons();
     document.querySelectorAll(".writing-input").forEach((input) => {
+      input.value = state.writing[input.id] || "";
       let statusTimer;
       input.addEventListener("input", () => {
         window.clearTimeout(statusTimer);
@@ -1070,7 +1196,7 @@
         status.textContent = "正在暂存";
         statusTimer = window.setTimeout(() => {
           state.writing[input.id] = input.value;
-          status.textContent = "已暂存于当前会话";
+          status.textContent = state.storageAvailable ? "已暂存于本浏览器" : "暂存不可用，请保持页面打开";
         }, 350);
       });
     });
@@ -1245,15 +1371,12 @@
             <button class="button button--primary" type="button" id="confirm-finish">确认结束</button>
             <button class="button button--secondary" type="button" id="contact-researcher">我想联系现场研究者</button>
           </div>
+          <p class="error-note" id="completion-error"></p>
         </div>
       </section>
     `);
 
-    document.getElementById("confirm-finish").addEventListener("click", () => {
-      submitCompletion("complete");
-      document.getElementById("confirm-finish").disabled = true;
-      document.getElementById("confirm-finish").textContent = "已完成";
-    });
+    document.getElementById("confirm-finish").addEventListener("click", () => saveCompletion("complete", "confirm-finish", "completion-error", "已完成"));
     document.getElementById("contact-researcher").addEventListener("click", () => navigate("support"));
   }
 
@@ -1268,16 +1391,13 @@
           <div class="completion-card__divider"></div>
           <p>暂停或退出不会影响你已经享有的参与者权利，报酬安排以知情同意书为准。</p>
           <div class="button-row" style="justify-content: center">
-            <button class="button button--primary" type="button" id="notify-researcher">通知现场研究者</button>
+            <button class="button button--primary" type="button" id="notify-researcher">记录支持请求</button>
           </div>
+          <p class="error-note" id="support-error"></p>
         </div>
       </section>
     `);
-    document.getElementById("notify-researcher").addEventListener("click", () => {
-      submitCompletion("support_requested");
-      document.getElementById("notify-researcher").disabled = true;
-      document.getElementById("notify-researcher").textContent = "已记录请求";
-    });
+    document.getElementById("notify-researcher").addEventListener("click", () => saveCompletion("support_requested", "notify-researcher", "support-error", "已记录请求，请当面告知研究者"));
   }
 
   function renderWithdrawn() {
@@ -1286,46 +1406,89 @@
         <div class="completion-card">
           <p class="eyebrow">流程已结束</p>
           <h2>你的选择已确认</h2>
-          <p>你没有参加本次研究。无需进行后续操作。</p>
+          <p>本次实验流程已结束，网页不会继续文字任务。</p>
           <div class="completion-card__divider"></div>
           <p>如果你是在实验过程中退出，请联系现场研究者了解后续安排。</p>
+          ${state.participantId ? '<button class="button button--secondary" type="button" id="save-withdrawal">保存退出记录</button><p class="error-note" id="withdrawal-error"></p>' : ''}
         </div>
       </section>
     `);
+    const button = document.getElementById("save-withdrawal");
+    if (button) button.onclick = () => saveCompletion("withdrawn", "save-withdrawal", "withdrawal-error", "退出记录已保存");
   }
 
-  function submitCompletion(status) {
-    if (isLocalPreview() && !config.API_BASE) return;
-    apiRequest(config.ENDPOINTS.complete, {
+  async function submitCompletion(status) {
+    if (state.previewMode || (isLocalPreview() && !config.API_BASE)) return;
+    await apiRequest(config.ENDPOINTS.complete, {
       participantId: state.participantId,
       status,
       condition: state.condition,
       event: state.event,
       pretest: state.pretest,
-      posttest: state.posttest,
+      posttest: { ...state.posttest, taskTiming: { ...state.taskTiming } },
       writing: state.condition === "writing" ? state.writing : undefined,
-    }).catch(() => {
-      // 完整的保存失败处理应由后端接入时统一实现。
     });
+    state.submitted = true;
+    clearSession();
+  }
+
+  async function saveCompletion(status, buttonId, errorId, label) {
+    const button = document.getElementById(buttonId);
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "正在保存…";
+    try { await submitCompletion(status); button.textContent = label; }
+    catch (_) {
+      button.disabled = false;
+      button.textContent = original;
+      showError("暂时未能保存提交，进度已留在本浏览器。请检查网络后重试，或联系现场研究者。", errorId);
+      persistSession();
+    }
   }
 
   function bindExitButtons() {
     document.querySelectorAll("[data-exit]").forEach((button) => {
-      button.addEventListener("click", () => exitDialog.showModal());
+      button.addEventListener("click", () => {
+        document.getElementById("exit-check").checked = false;
+        exitDialog.querySelector("[data-confirm-exit]").disabled = true;
+        exitDialog.showModal();
+      });
     });
   }
 
   function bindDialog() {
+    document.getElementById("task-dialog-support").addEventListener("click", () => navigate("support"));
     document.getElementById("task-dialog-back").addEventListener("click", () => taskDialog.close());
-    document.getElementById("task-dialog-confirm").addEventListener("click", finishTask);
+    document.getElementById("task-dialog-confirm").addEventListener("click", () => {
+      if (state.taskExpired) { finishTask(); return; }
+      if (earlyEndStep === 0) {
+        earlyEndStep = 1;
+        document.getElementById("task-dialog-title").textContent = "再次确认提前结束";
+        document.getElementById("task-dialog-text").textContent = "确认后，剩余时间将不再用于本次文字任务。若是误点，请选择继续任务。";
+        document.getElementById("task-dialog-check-wrap").hidden = false;
+        document.getElementById("task-dialog-confirm").textContent = "确认提前结束并进入后测";
+        document.getElementById("task-dialog-confirm").disabled = true;
+        document.getElementById("task-dialog-check").focus();
+      } else if (document.getElementById("task-dialog-check").checked) finishTask();
+    });
+    document.getElementById("task-dialog-check").addEventListener("change", (event) => {
+      document.getElementById("task-dialog-confirm").disabled = !event.target.checked;
+    });
+    document.getElementById("exit-check").addEventListener("change", (event) => {
+      exitDialog.querySelector("[data-confirm-exit]").disabled = !event.target.checked;
+    });
+    document.addEventListener("input", persistSession);
+    document.addEventListener("change", persistSession);
+    window.addEventListener("pagehide", persistSession);
     document.addEventListener("visibilitychange", () => {
+      persistSession();
       if (!document.hidden) updateTaskTimer();
     });
     exitDialog.querySelector("[data-dialog-close]").addEventListener("click", () => exitDialog.close());
     exitDialog.querySelector("[data-confirm-exit]").addEventListener("click", () => {
       exitDialog.close();
-      submitCompletion("withdrawn");
       navigate("withdrawn");
+      saveCompletion("withdrawn", "save-withdrawal", "withdrawal-error", "退出记录已保存");
     });
     exitDialog.addEventListener("click", (event) => {
       if (event.target === exitDialog) exitDialog.close();
@@ -1402,9 +1565,12 @@
       default:
         renderHome();
     }
+    restoreFormDrafts();
+    persistSession();
   }
 
   bindDialog();
-  applyPreviewRoute();
-  renderCurrentScreen();
+  if (!applyPreviewRoute()) recoverySnapshot = loadSession();
+  if (recoverySnapshot) renderRecovery();
+  else renderCurrentScreen();
 })();

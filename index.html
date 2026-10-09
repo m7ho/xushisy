@@ -10,7 +10,7 @@
     <meta name="theme-color" content="#123f46" />
     <title>近期事件回忆与文字表达研究</title>
     <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
-    <link rel="stylesheet" href="css/styles.css?v=20261008" />
+    <link rel="stylesheet" href="css/styles.css?v=20261008-v3" />
   </head>
   <body>
     <noscript>
@@ -24,13 +24,14 @@
         <p class="eyebrow">退出确认</p>
         <h2>确定要结束本次实验吗？</h2>
         <p>
-          退出后，本次任务将结束。你无需说明原因，相关安排以知情同意书为准。
+          这是退出整个实验，之后不能从文字任务继续。如果只是暂时关闭页面，请先联系现场研究者。你无需说明退出原因。
         </p>
+        <label class="confirm-choice"><input type="checkbox" id="exit-check" /> 我确认退出整个实验</label>
         <div class="dialog__actions">
           <button class="button button--ghost" type="button" data-dialog-close>
             继续实验
           </button>
-          <button class="button button--danger" type="button" data-confirm-exit>
+          <button class="button button--danger" type="button" data-confirm-exit disabled>
             确认退出
           </button>
         </div>
@@ -41,14 +42,16 @@
       <div class="dialog__body">
         <h2 id="task-dialog-title">准备结束文字任务了吗？</h2>
         <p id="task-dialog-text"></p>
+        <label class="confirm-choice" id="task-dialog-check-wrap" hidden><input type="checkbox" id="task-dialog-check" /> 我确认提前结束本次文字任务</label>
         <div class="dialog__actions">
           <button class="button button--ghost" type="button" id="task-dialog-back">继续任务</button>
+          <button class="button button--secondary" type="button" id="task-dialog-support" hidden>我需要现场研究者</button>
           <button class="button button--primary" type="button" id="task-dialog-confirm">进入后测</button>
         </div>
       </div>
     </dialog>
 
-    <script src="js/config.js?v=20261008"></script>
-    <script src="js/app.js?v=20261008"></script>
+    <script src="js/config.js?v=20261008-v3"></script>
+    <script src="js/app.js?v=20261008-v3"></script>
   </body>
 </html>

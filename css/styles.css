@@ -1351,6 +1351,17 @@ body.task-screen {
 [hidden] {
   display: none !important;
 }
+
+.task-notice[data-phase="closing"],
+.task-notice[data-phase="last-seconds"] {
+  background: #fff7e9;
+  border-left: 4px solid #ba8b45;
+  color: #6b502d;
+}
+.task-notice[data-phase="last-seconds"] { background: #fff1dc; }
+.task-notice[data-phase="ended"] { border-left: 4px solid #28666d; }
+.confirm-choice { display: flex; gap: .65rem; align-items: flex-start; margin: 1.3rem 0; }
+.confirm-choice input { flex: 0 0 auto; margin-top: .35rem; }
 @media (max-width: 640px), (max-height: 650px) {
   .task-screen .site-header__inner {
     min-height: 46px;
