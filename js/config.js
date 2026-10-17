@@ -12,4 +12,5 @@ window.EXPERIMENT_CONFIG = {
   },
   TASK_DURATION_SECONDS: 12 * 60,
   ENABLE_LOCAL_PREVIEW: true,
+  ASSIGNMENT_MODE: "pilot_ai",
 };

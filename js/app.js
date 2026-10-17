@@ -139,7 +139,23 @@
       <p>请由这位参与者继续操作。如果不是同一位参与者，或误点了确认退出，请先联系现场研究者。</p>
       <button class="button button--primary" type="button" id="resume-session">恢复原来的进度</button>
     </div></section>`, { hideProgress: true, participant: false });
-    document.getElementById("resume-session").onclick = () => {
+    document.getElementById("resume-session").onclick = async () => {
+      const button = document.getElementById("resume-session");
+      button.disabled = true;
+      const saved = recoverySnapshot.state;
+      if (config.ASSIGNMENT_MODE === "pilot_ai" && saved.currentScreen === "writing") {
+        try {
+          const assignment = await apiRequest(config.ENDPOINTS.randomize, { participantId: saved.participantId });
+          if (assignment.condition !== "ai") throw new Error("预实验分组尚未开启");
+          saved.condition = "ai";
+          saved.currentScreen = "chat";
+          saved.taskTiming.migratedFromWritingAt = new Date().toISOString();
+        } catch (_) {
+          button.disabled = false;
+          button.textContent = "暂时无法恢复AI任务，请稍后重试或联系研究者";
+          return;
+        }
+      }
       const savedAt = recoverySnapshot.savedAt;
       Object.assign(state, recoverySnapshot.state);
       recoverySnapshot = null;
@@ -700,9 +716,12 @@
     try {
       let condition;
       if (isLocalPreview()) {
-        const randomValue = new Uint32Array(1);
-        window.crypto.getRandomValues(randomValue);
-        condition = randomValue[0] % 2 === 0 ? "ai" : "writing";
+        if (config.ASSIGNMENT_MODE === "pilot_ai") condition = "ai";
+        else {
+          const randomValue = new Uint32Array(1);
+          window.crypto.getRandomValues(randomValue);
+          condition = randomValue[0] % 2 === 0 ? "ai" : "writing";
+        }
         await new Promise((resolve) => window.setTimeout(resolve, 650));
       } else {
         const result = await apiRequest(config.ENDPOINTS.randomize, {
@@ -1413,7 +1432,7 @@
       event: state.event,
       pretest: state.pretest,
       posttest: { ...state.posttest, taskTiming: { ...state.taskTiming } },
-      writing: state.condition === "writing" ? state.writing : undefined,
+      writing: state.condition === "writing" || state.taskTiming.migratedFromWritingAt ? state.writing : undefined,
     });
     state.submitted = true;
     clearSession();
