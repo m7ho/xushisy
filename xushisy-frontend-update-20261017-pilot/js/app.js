@@ -1,0 +1,1582 @@
+(function () {
+  "use strict";
+
+  const config = window.EXPERIMENT_CONFIG || {};
+  const app = document.getElementById("app");
+  const exitDialog = document.getElementById("exit-dialog");
+  const taskDialog = document.getElementById("task-dialog");
+
+  const bsriItems = [
+    "此时此刻，我反复思虑自己的负面情绪。",
+    "此时此刻，我想知道我为什么会反复思虑负面情绪。",
+    "此时此刻，我很难摆脱自己的负面想法。",
+    "此时此刻，我正在脑海里反复回想最近说或做过的事情。",
+    "此时此刻，我在想“为什么我不能更好地处理事情？”",
+    "此时此刻，我很难摆脱负面情绪。",
+    "此时此刻，我正在想“面对负面情绪为什么我只能反复思虑它？”",
+    "此时此刻，我正在想“为什么我总是如此？”",
+  ];
+
+  const commonUsabilityItems = [
+    "这个页面的功能满足了我完成本次文字任务的需要。",
+    "这个页面易于使用。",
+    "页面上的说明清楚易懂。",
+    "在任务过程中，我一直知道下一步需要做什么。",
+    "页面让我能够按照合适的节奏完成任务。",
+    "技术问题影响了我完成任务。",
+  ];
+
+  const aiExperienceItems = [
+    "页面回应与我刚才表达的内容有关。",
+    "页面能够承接我在前面已经说过的信息。",
+    "对话中的提问出现了不必要的重复。",
+    "我能够决定表达多少内容以及何时结束。",
+  ];
+
+  const writingExperienceItems = [
+    "四个书写提示与本次任务有关。",
+    "不同提示之间有不必要的重复。",
+    "12 分钟的书写时间对我来说合适。",
+    "我能够决定表达多少内容以及何时结束。",
+  ];
+
+  const state = {
+    participantId: "",
+    currentScreen: "home",
+    condition: null,
+    event: {
+      label: "",
+      summary: "",
+      coreThought: "",
+    },
+    pretest: {},
+    posttest: {},
+    messages: [],
+    writing: {},
+    timerId: null,
+    taskDeadline: null,
+    taskStartedAt: null,
+    taskExpired: false,
+    chatBusy: false,
+    pendingChat: null,
+    chatController: null,
+    taskTiming: {},
+    secondsRemaining: Number(config.TASK_DURATION_SECONDS) || 720,
+    previewMode: false,
+    formDrafts: {},
+    chatDraft: "",
+    submitted: false,
+    storageAvailable: true,
+  };
+
+  const SESSION_KEY = "xushisy.session.v3";
+  const SESSION_TTL = 24 * 60 * 60 * 1000;
+  let recoverySnapshot = null;
+  let earlyEndStep = 0;
+
+  function clearSession() {
+    try { window.localStorage.removeItem(SESSION_KEY); } catch (_) { /* 存储不可用 */ }
+  }
+
+  function persistSession() {
+    if (state.previewMode || recoverySnapshot || !state.participantId || state.submitted) return;
+    captureTaskDrafts();
+    const fields = [...app.querySelectorAll("input, textarea, select")]
+      .filter((input) => input.id || input.name)
+      .map((input) => ({ id: input.id, name: input.name, value: input.value,
+        checked: input.checked, touched: input.dataset.touched }));
+    state.formDrafts[state.currentScreen] = fields;
+    const saved = {};
+    ["participantId", "currentScreen", "condition", "event", "pretest", "posttest",
+      "messages", "writing", "taskDeadline", "taskStartedAt", "taskExpired", "taskTiming",
+      "formDrafts", "chatDraft"].forEach((key) => { saved[key] = state[key]; });
+    saved.pendingChat = state.pendingChat ? { start: state.pendingChat.start, turnNumber: state.pendingChat.turnNumber } : null;
+    try {
+      window.localStorage.setItem(SESSION_KEY, JSON.stringify({ version: 3, savedAt: Date.now(), state: saved }));
+      state.storageAvailable = true;
+    } catch (_) {
+      state.storageAvailable = false;
+      const text = document.getElementById("task-notice-text");
+      if (text) text.textContent = "浏览器暂存不可用。请保持页面打开；需要离开时联系现场研究者。";
+    }
+  }
+
+  function loadSession() {
+    try {
+      const saved = JSON.parse(window.localStorage.getItem(SESSION_KEY));
+      if (!saved) return null;
+      if (saved.version !== 3 || !Number.isFinite(saved.savedAt) || Date.now() - saved.savedAt > SESSION_TTL ||
+          !saved.state?.participantId || !screenStage[saved.state.currentScreen] ||
+          !Array.isArray(saved.state.messages) || !saved.state.formDrafts ||
+          (saved.state.taskDeadline !== null && !Number.isFinite(saved.state.taskDeadline))) {
+        clearSession(); return null;
+      }
+      return saved;
+    } catch (_) { clearSession(); return null; }
+  }
+
+  function restoreFormDrafts() {
+    (state.formDrafts[state.currentScreen] || []).forEach((field) => {
+      const inputs = field.id ? [document.getElementById(field.id)] :
+        [...app.querySelectorAll("input")].filter((input) => input.name === field.name && input.value === field.value);
+      inputs.filter(Boolean).forEach((input) => {
+        if (input.type === "radio" || input.type === "checkbox") input.checked = Boolean(field.checked);
+        else input.value = field.value;
+        if (input.type === "range" && field.touched === "true") {
+          input.dataset.touched = "true";
+          const output = document.getElementById(`${input.id}-value`);
+          if (output) { output.dataset.empty = "false"; output.textContent = input.value; output.value = input.value; }
+        }
+      });
+    });
+  }
+
+  function renderRecovery() {
+    renderShell(`<section class="completion"><div class="completion-card">
+      <p class="eyebrow">发现未完成的实验</p><h2>可以从离开的地方继续</h2>
+      <p>本浏览器保存了参与者编号 ${escapeHtml(recoverySnapshot.state.participantId)} 的进度。</p>
+      <p>文字任务的计时会继续按原定截止时间计算，离开页面不会暂停或重置计时。若已到时间，将保留内容并进入结束确认。</p>
+      <p>请由这位参与者继续操作。如果不是同一位参与者，或误点了确认退出，请先联系现场研究者。</p>
+      <button class="button button--primary" type="button" id="resume-session">恢复原来的进度</button>
+    </div></section>`, { hideProgress: true, participant: false });
+    document.getElementById("resume-session").onclick = async () => {
+      const button = document.getElementById("resume-session");
+      button.disabled = true;
+      const saved = recoverySnapshot.state;
+      if (config.ASSIGNMENT_MODE === "pilot_ai" && saved.currentScreen === "writing") {
+        try {
+          const assignment = await apiRequest(config.ENDPOINTS.randomize, { participantId: saved.participantId });
+          if (assignment.condition !== "ai") throw new Error("预实验分组尚未开启");
+          saved.condition = "ai";
+          saved.currentScreen = "chat";
+          saved.taskTiming.migratedFromWritingAt = new Date().toISOString();
+        } catch (_) {
+          button.disabled = false;
+          button.textContent = "暂时无法恢复AI任务，请稍后重试或联系研究者";
+          return;
+        }
+      }
+      const savedAt = recoverySnapshot.savedAt;
+      Object.assign(state, recoverySnapshot.state);
+      recoverySnapshot = null;
+      state.chatBusy = false;
+      state.chatController = null;
+      state.taskTiming.recoveries = [...(state.taskTiming.recoveries || []), {
+        resumedAt: new Date().toISOString(), lastSavedAt: new Date(savedAt).toISOString(),
+        remainingSeconds: remainingSeconds(),
+      }];
+      renderCurrentScreen();
+    };
+  }
+
+  const screenStage = {
+    consent: 1,
+    event: 2,
+    "bsri-pre": 2,
+    "event-pre": 2,
+    assigning: 2,
+    chat: 3,
+    writing: 3,
+    "bsri-post": 4,
+    "event-post": 4,
+    usability: 4,
+    complete: 5,
+    support: 5,
+    withdrawn: 5,
+  };
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function isLocalPreview() {
+    return (
+      config.ENABLE_LOCAL_PREVIEW &&
+      (window.location.protocol === "file:" ||
+        ["localhost", "127.0.0.1"].includes(window.location.hostname))
+    );
+  }
+
+  function apiUrl(endpoint) {
+    const base = String(config.API_BASE || "").replace(/\/$/, "");
+    return `${base}${endpoint}`;
+  }
+
+  async function apiRequest(endpoint, payload) {
+    const response = await fetch(apiUrl(endpoint), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+
+    if (!response.ok) {
+      throw new Error(`请求失败 ${response.status}`);
+    }
+
+    return response.json();
+  }
+
+  function renderHeader(showParticipant = true) {
+    const participant =
+      showParticipant && state.participantId
+        ? `<span class="participant-pill">参与者编号 ${escapeHtml(state.participantId)}</span>`
+        : "";
+
+    return `
+      <header class="site-header">
+        <div class="site-header__inner">
+          <div class="brand" aria-label="近期事件回忆与文字表达研究">
+            <span class="brand__mark" aria-hidden="true"></span>
+            <span class="brand__text">近期事件回忆与文字表达研究</span>
+          </div>
+          ${participant}
+        </div>
+      </header>
+    `;
+  }
+
+  function renderProgress(stage) {
+    const stages = ["知情同意", "前测", "文字任务", "后测", "完成"];
+    const progress = ((stage - 1) / (stages.length - 1)) * 100;
+    return `
+      <div class="progress-wrap" aria-label="实验进度">
+        <div class="progress-track">
+          <div class="progress-fill" style="--progress: ${progress}%"></div>
+        </div>
+        <div class="progress-labels">
+          ${stages
+            .map(
+              (label, index) =>
+                `<span class="${index + 1 === stage ? "is-current" : ""}">${label}</span>`,
+            )
+            .join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  function renderShell(content, options = {}) {
+    const { home = false, hideProgress = false, participant = true } = options;
+    const stage = screenStage[state.currentScreen] || 1;
+    const taskScreen = ["chat", "writing"].includes(state.currentScreen);
+    document.body.classList.toggle("task-screen", taskScreen);
+    document.documentElement.classList.toggle("task-screen", taskScreen);
+    app.innerHTML = `
+      <div class="shell">
+        ${renderHeader(participant)}
+        ${hideProgress ? "" : renderProgress(stage)}
+        <main class="main ${home ? "main--home" : ""}" id="main-content">
+          ${content}
+        </main>
+      </div>
+    `;
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }
+
+  function showError(message, id = "page-error") {
+    const error = document.getElementById(id);
+    if (!error) return;
+    error.textContent = message;
+    error.classList.add("is-visible");
+    error.setAttribute("role", "alert");
+  }
+
+  function navigate(screen) {
+    if (["chat", "writing"].includes(state.currentScreen) && ["support", "withdrawn"].includes(screen)) {
+      captureTaskDrafts();
+      if (state.taskStartedAt !== null && !state.taskTiming.endedAt) {
+        state.taskTiming.endedAt = new Date().toISOString();
+        state.taskTiming.actualSeconds = Math.min(state.taskTiming.plannedSeconds, Math.round((Date.now() - state.taskStartedAt) / 1000));
+        state.taskTiming.endReason = state.taskTiming.endReason || (screen === "support" ? "support_requested" : "withdrawn");
+      }
+    }
+    persistSession();
+    clearTaskTimer();
+    state.chatController?.abort();
+    taskDialog.close();
+    state.currentScreen = screen;
+    renderCurrentScreen();
+  }
+
+  function renderHome() {
+    renderShell(
+      `
+        <section class="hero">
+          <div class="hero__visual">
+            <img
+              class="hero__image"
+              src="assets/hero-reflection.png"
+              alt="柔和色块与线条组成的抽象画面"
+            />
+            <div class="hero__caption">
+              <span>文字研究 · 匿名编号参与</span>
+              <span>研究用途</span>
+            </div>
+          </div>
+          <div class="hero__content">
+            <p class="eyebrow">大学生毕业研究</p>
+            <h1>留一点时间，看看此刻的想法</h1>
+            <p class="lead">
+              你将回想一件近期发生的日常事件，完成简短问卷，并进行一次约 12 分钟的文字任务。
+            </p>
+            <div class="hero__meta" aria-label="实验信息">
+              <span>全程约 25 至 30 分钟</span>
+              <span>可随时退出</span>
+              <span>不提供诊断或治疗</span>
+            </div>
+            <form id="start-form">
+              <div class="form-field">
+                <label class="form-label" for="participant-id">参与者编号</label>
+                <input
+                  class="text-input"
+                  id="participant-id"
+                  name="participant-id"
+                  type="text"
+                  autocomplete="off"
+                  maxlength="32"
+                  required
+                  placeholder="请输入研究者提供的编号"
+                />
+                <p class="form-hint">请勿填写姓名、学号、手机号或其他身份信息。</p>
+              </div>
+              <div class="button-row">
+                <button class="button button--primary button--wide" type="submit">
+                  开始实验
+                </button>
+              </div>
+              <p class="tiny-note">点击后将先进入知情同意页面，正式开始前仍可决定不参加。</p>
+            </form>
+          </div>
+        </section>
+      `,
+      { home: true, hideProgress: true, participant: false },
+    );
+
+    document.getElementById("start-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const input = document.getElementById("participant-id");
+      const participantId = input.value.trim();
+      if (!participantId) {
+        input.focus();
+        return;
+      }
+      state.participantId = participantId;
+      navigate("consent");
+    });
+  }
+
+  function renderConsent() {
+    renderShell(`
+      <div class="page-title">
+        <p class="eyebrow">第一步</p>
+        <h2>实验知情同意书</h2>
+        <p class="lead">请完整阅读以下内容。若有疑问，可以在决定前询问研究人员。</p>
+      </div>
+      <div class="page-grid page-grid--wide">
+        <section class="card" aria-labelledby="consent-title">
+          <div class="card__body">
+            <div class="consent-document" id="consent-document" tabindex="0">
+              <p>尊敬的参与者：</p>
+              <p>您好！感谢您关注并考虑参加本研究。在您决定是否参加之前，请仔细阅读以下内容。研究人员将向您说明本研究的目的、流程、可能的风险与收益、数据处理方式以及您的相关权利。若您对任何内容存在疑问，可在决定是否参加前向研究人员提出。</p>
+              <p>请您在充分理解本说明并自愿同意后参加本研究。</p>
+              <h3 id="consent-title">研究简介</h3>
+              <p>本研究旨在开发和初步验证一款基于大语言模型的文字对话工具，用于帮助大学生在受到日常负面事件反复困扰时，对相关想法进行表达、观察和整理。</p>
+              <p>研究主要关注日常生活中的负面事件，例如学业或工作受挫、普通人际冲突、社交尴尬、一般失败、后悔或自我批评等。</p>
+              <p>本研究中的工具仅用于科研和日常心理调节探索，不用于心理疾病诊断或治疗，也不能替代心理咨询、心理治疗、医疗服务或危机干预。</p>
+              <h3>研究参与流程</h3>
+              <p>如果您同意参加本研究，您将按照网页提示完成以下内容：</p>
+              <ol>
+                <li>阅读本知情同意书并进行安全确认；</li>
+                <li>回忆一件近期使您反复困扰的日常负面事件；</li>
+                <li>完成实验前的简短问卷；</li>
+                <li>按照系统提示完成约12分钟的文字互动任务；</li>
+                <li>完成实验后的简短问卷；</li>
+                <li>在约3天后完成一次简短的线上随访问卷。</li>
+              </ol>
+              <p>部分参与者还可能在之后收到访谈邀请。是否参加访谈由您自行决定，拒绝访谈不会影响您参与本研究的其他权益。</p>
+              <h3>研究涉及的表达内容</h3>
+              <p>实验过程中，您需要围绕一件近期的日常负面事件进行文字表达，例如：学业或工作中的一般受挫、普通人际冲突、社交尴尬、一般性的失败或后悔、自我批评等反复出现的想法。</p>
+              <p>本研究不要求您讨论严重创伤、暴力、虐待、重大丧失、自伤或伤害他人的想法、违法行为、当前现实危险等内容。</p>
+              <p>请尽量避免在网页中输入可以直接识别您身份的信息，例如真实姓名、学校名称、电话号码、身份证号码、详细住址等。</p>
+              <h3>可能的风险或不适</h3>
+              <p>由于实验需要您回忆和表达近期的负面经历，过程中可能暂时出现以下情况：情绪低落、烦躁、焦虑或不适；再次想起令人困扰的经历；在持续表达或完成任务过程中感到疲惫；对部分问题或任务内容感到不愿继续回答；在完成文字互动任务时，可能出现与自身预期不一致或体验不佳的情况。</p>
+              <p>如果您在任何时候感到不舒服，可以暂停作答、跳过不愿回答的内容、直接退出实验，或告知现场研究人员您不希望继续参加。您无需说明退出理由，退出不会影响您应有的权益。</p>
+              <p>如果系统或研究人员发现您当前可能存在自伤、伤害他人、严重失控或其他现实危险，正常实验流程将被停止，网页将显示固定的安全提示和求助信息，并由现场研究人员按照预先制定的安全流程进行处理。</p>
+              <h3>可能的收益</h3>
+              <p>参加本研究可能为您提供一次围绕近期困扰进行结构化表达和整理的机会。部分参与者可能会在实验过程中对反复出现的负面想法产生新的观察角度，或者感到与这些想法之间形成了一定距离；也可能没有明显变化。但本研究不能保证您一定会获得情绪改善。</p>
+              <p>本研究获得的数据将用于探索日常心理调节工具的设计和安全使用方式，并为相关研究提供参考。</p>
+              <p>完成本研究相应环节后，您将按照研究招募说明获得相应的参与报酬。</p>
+              <h3>隐私和数据保密</h3>
+              <p>本研究将尽可能保护您的个人隐私，并按照研究所需的最小范围收集和使用相关数据。实验数据主要通过匿名参与者编号进行记录。研究数据库不会以您的姓名作为识别方式。用于后续随访的联系方式如需收集，将与主要研究数据分开保存，不会直接与您的实验内容放在同一数据表中。</p>
+              <p>您在本研究中产生的数据仅用于本研究及与本研究直接相关的毕业论文、学术分析和研究报告。不会公开您的姓名、联系方式等直接身份信息，也不会以能够直接识别您个人身份的方式展示实验内容。</p>
+              <p>研究数据的具体保存期限和删除方式将按照伦理审查批准后的研究数据管理方案执行。</p>
+              <h3>联系方式</h3>
+              <p>如果您对本研究的内容、实验流程、数据使用或参与者权益有疑问，可以联系研究者。</p>
+              <p>如您在研究过程中出现明显心理不适，也可以联系学校心理咨询中心或其他专业心理健康服务机构。如存在紧急的人身安全风险，请及时联系当地紧急救助服务。</p>
+            </div>
+
+            <form class="consent-confirm" id="consent-form">
+              <h3>知情同意确认</h3>
+              <label class="choice">
+                <input type="radio" name="consent" value="agree" required />
+                <span>
+                  <strong>我自愿同意参加</strong>
+                  <span>我已年满18周岁，已阅读并理解以上内容，自愿同意参加本研究。</span>
+                </span>
+              </label>
+              <label class="choice">
+                <input type="radio" name="consent" value="decline" required />
+                <span>
+                  <strong>我不同意参加</strong>
+                  <span>选择后将结束本次流程。</span>
+                </span>
+              </label>
+              <div class="button-row">
+                <button class="button button--primary" type="submit">确认选择</button>
+              </div>
+            </form>
+          </div>
+        </section>
+        <aside class="side-note">
+          <h3>你可以随时停下</h3>
+          <p>阅读、作答和文字任务过程中都可以选择退出，无需说明原因。</p>
+          <p>请勿在文本中填写真实姓名、学校、地址、电话等身份信息。</p>
+        </aside>
+      </div>
+    `);
+
+    document.getElementById("consent-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const selected = new FormData(event.currentTarget).get("consent");
+      navigate(selected === "agree" ? "event" : "withdrawn");
+    });
+  }
+
+  function renderEventRecall() {
+    renderShell(`
+      <div class="page-title">
+        <p class="eyebrow">前测 · 事件回忆</p>
+        <h2>选择一件近期反复想起的事</h2>
+        <p class="lead">请回想近 14 天内一件让你感到困扰、并且曾在脑中反复出现的日常负面事件。</p>
+      </div>
+      <div class="page-grid">
+        <form class="card" id="event-form">
+          <div class="card__body section-stack">
+            <div class="form-field">
+              <label class="form-label" for="event-label">给这件事取一个简短的代称</label>
+              <input
+                class="text-input"
+                id="event-label"
+                name="event-label"
+                type="text"
+                minlength="2"
+                maxlength="20"
+                required
+                autocomplete="off"
+                placeholder="请勿写真实姓名或具体地点"
+              />
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="event-summary">这件事发生了什么？</label>
+              <textarea
+                class="text-area"
+                id="event-summary"
+                name="event-summary"
+                minlength="10"
+                maxlength="500"
+                required
+                placeholder="请用 1 至 3 句话写下你认为必要的经过"
+              ></textarea>
+            </div>
+            <div class="form-field">
+              <label class="form-label" for="core-thought">想到这件事时，你脑中最常反复出现的一句话是什么？</label>
+              <textarea
+                class="text-area"
+                id="core-thought"
+                name="core-thought"
+                maxlength="200"
+                required
+                placeholder="请尽量用一句话写下来"
+              ></textarea>
+            </div>
+            <p class="error-note" id="page-error"></p>
+            <div class="button-row">
+              <button class="button button--primary" type="submit">进入前测问卷</button>
+              <button class="button button--ghost" type="button" data-exit>退出实验</button>
+            </div>
+          </div>
+        </form>
+        <aside class="side-note">
+          <h3>事件范围</h3>
+          <p>可以选择学业或工作受挫、普通人际冲突、社交尴尬、一般失败、后悔或自我批评等事件。</p>
+          <p>请不要选择严重创伤、暴力、虐待、重大丧失、自伤他伤、违法行为或当前现实危险。</p>
+        </aside>
+      </div>
+    `);
+
+    bindExitButtons();
+    document.getElementById("event-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      state.event = {
+        label: document.getElementById("event-label").value.trim(),
+        summary: document.getElementById("event-summary").value.trim(),
+        coreThought: document.getElementById("core-thought").value.trim(),
+      };
+      navigate("bsri-pre");
+    });
+  }
+
+  function rangeQuestion(name, question, minLabel, maxLabel, max = 100) {
+    return `
+      <div class="question-card">
+        <div class="range-field">
+          <div class="range-field__top">
+            <label class="form-label" for="${name}">${question}</label>
+            <output class="range-value" id="${name}-value" data-empty="true">待选择</output>
+          </div>
+          <input
+            class="range-input"
+            id="${name}"
+            name="${name}"
+            type="range"
+            min="0"
+            max="${max}"
+            value="${Math.round(max / 2)}"
+            data-touched="false"
+            aria-describedby="${name}-labels"
+          />
+          <div class="range-labels" id="${name}-labels">
+            <span>0 ${minLabel}</span>
+            <span>${max} ${maxLabel}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function bindRanges() {
+    document.querySelectorAll(".range-input").forEach((input) => {
+      const output = document.getElementById(`${input.id}-value`);
+      const update = () => {
+        input.dataset.touched = "true";
+        output.dataset.empty = "false";
+        output.value = input.value;
+        output.textContent = input.value;
+      };
+      input.addEventListener("input", update);
+      input.addEventListener("change", update);
+    });
+  }
+
+  function collectRanges(form) {
+    const result = {};
+    const ranges = [...form.querySelectorAll(".range-input")];
+    const untouched = ranges.find((input) => input.dataset.touched !== "true");
+    if (untouched) {
+      untouched.focus();
+      showError("请完成所有题目后再继续。", form.querySelector(".error-note").id);
+      return null;
+    }
+    ranges.forEach((input) => {
+      result[input.name] = Number(input.value);
+    });
+    return result;
+  }
+
+  function renderBsri(phase) {
+    const isPre = phase === "pre";
+    const title = isPre ? "实验前问卷" : "任务后的感受";
+    renderShell(`
+      <div class="page-title">
+        <p class="eyebrow">${isPre ? "前测" : "后测"} · BSRI</p>
+        <h2>${title}</h2>
+        <p class="lead">请根据此时此刻的真实感受作答。每道题都需要主动点击或拖动量尺。</p>
+      </div>
+      <form class="card" id="bsri-form">
+        <div class="card__body section-stack">
+          ${bsriItems
+            .map((item, index) =>
+              rangeQuestion(
+                `bsri-${index + 1}`,
+                `${index + 1}. ${item}`,
+                "完全不同意",
+                "完全同意",
+              ),
+            )
+            .join("")}
+          <p class="error-note" id="bsri-error"></p>
+          <div class="button-row">
+            <button class="button button--primary" type="submit">继续</button>
+            <button class="button button--ghost" type="button" data-exit>退出实验</button>
+          </div>
+        </div>
+      </form>
+    `);
+
+    bindRanges();
+    bindExitButtons();
+    document.getElementById("bsri-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const values = collectRanges(event.currentTarget);
+      if (!values) return;
+      const target = isPre ? state.pretest : state.posttest;
+      target.bsri = Object.values(values);
+      navigate(isPre ? "event-pre" : "event-post");
+    });
+  }
+
+  function renderEventMeasures(phase) {
+    const isPre = phase === "pre";
+    const eventLabel = state.event.label || "你选择的事件";
+    const coreThought = state.event.coreThought || "你在前测中写下的那句话";
+    renderShell(`
+      <div class="page-title">
+        <p class="eyebrow">${isPre ? "前测" : "后测"} · 事件相关问题</p>
+        <h2>此刻与这件事有关的感受</h2>
+        <p class="lead">请按第一反应作答。提交后将不能返回修改。</p>
+      </div>
+      <div class="page-grid">
+        <form class="card" id="event-measures-form">
+          <div class="card__body section-stack">
+            ${rangeQuestion(
+              "negative-emotion",
+              `此刻，当你想到“${escapeHtml(eventLabel)}”这件事时，你的负面情绪有多强烈？`,
+              "完全没有",
+              "极其强烈",
+            )}
+            ${rangeQuestion(
+              "thought-belief",
+              `你此前写下的想法是“${escapeHtml(coreThought)}”。此刻，你在多大程度上觉得这句话是真的？`,
+              "完全不相信",
+              "完全相信",
+            )}
+            ${rangeQuestion(
+              "thought-distance",
+              "此刻，你能在多大程度上不被这条想法牵着走？",
+              "完全被它牵着走",
+              "完全不被它牵着走",
+            )}
+            ${rangeQuestion(
+              "distress",
+              "此刻，这件事让你感到多困扰？",
+              "完全不困扰",
+              "极度困扰",
+              10,
+            )}
+            <p class="error-note" id="event-measures-error"></p>
+            <div class="button-row">
+              <button class="button button--primary" type="submit">${isPre ? "开始文字任务" : "继续"}</button>
+              <button class="button button--ghost" type="button" data-exit>退出实验</button>
+            </div>
+          </div>
+        </form>
+        <aside class="side-note">
+          <h3>关于作答</h3>
+          <p>量尺没有默认答案。每一道题都需要你主动点击或拖动后才能提交。</p>
+          <p>没有标准答案，也不需要猜测研究者希望看到怎样的变化。</p>
+        </aside>
+      </div>
+    `);
+
+    bindRanges();
+    bindExitButtons();
+    document.getElementById("event-measures-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const values = collectRanges(event.currentTarget);
+      if (!values) return;
+      const target = isPre ? state.pretest : state.posttest;
+      target.eventMeasures = values;
+      navigate(isPre ? "assigning" : "usability");
+    });
+  }
+
+  function renderAssigning() {
+    renderShell(`
+      <section class="loading-screen" aria-live="polite">
+        <div>
+          <div class="loading-orbit" aria-hidden="true"></div>
+          <h2>正在准备文字任务</h2>
+          <p class="lead">请保持当前页面打开，这通常只需要几秒钟。</p>
+          <p class="error-note" id="assign-error"></p>
+          <div class="button-row" id="assign-actions" hidden>
+            <button class="button button--primary" type="button" id="retry-assign">重新尝试</button>
+          </div>
+        </div>
+      </section>
+    `);
+    assignCondition();
+  }
+
+  async function assignCondition() {
+    try {
+      let condition;
+      if (isLocalPreview()) {
+        if (config.ASSIGNMENT_MODE === "pilot_ai") condition = "ai";
+        else {
+          const randomValue = new Uint32Array(1);
+          window.crypto.getRandomValues(randomValue);
+          condition = randomValue[0] % 2 === 0 ? "ai" : "writing";
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 650));
+      } else {
+        const result = await apiRequest(config.ENDPOINTS.randomize, {
+          participantId: state.participantId,
+        });
+        condition = result.condition;
+      }
+
+      if (!['ai', 'writing'].includes(condition)) {
+        throw new Error("分组结果无效");
+      }
+      state.condition = condition;
+      navigate(condition === "ai" ? "chat" : "writing");
+    } catch (error) {
+      showError("暂时无法准备任务，请检查网络后重新尝试或联系现场研究者。", "assign-error");
+      const actions = document.getElementById("assign-actions");
+      actions.hidden = false;
+      document.getElementById("retry-assign").addEventListener("click", () => {
+        actions.hidden = true;
+        document.getElementById("assign-error").classList.remove("is-visible");
+        assignCondition();
+      });
+    }
+  }
+
+  function timerMarkup() {
+    return `<span class="time-pill">剩余时间 <strong id="task-timer">${formatTime(remainingSeconds())}</strong></span>`;
+  }
+
+  function taskNoticeMarkup() {
+    return `<div class="task-notice" id="task-notice" role="status">
+      <span id="task-notice-text">本次任务为 12 分钟，结束前会提醒。内容自动暂存于本浏览器，误关闭后可恢复进度。</span>
+      <button class="button button--ghost" type="button" id="go-posttest" hidden>进入后测</button>
+    </div>`;
+  }
+
+  function formatTime(totalSeconds) {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  function remainingSeconds() {
+    return state.taskDeadline === null
+      ? Number(config.TASK_DURATION_SECONDS) || 720
+      : Math.max(0, Math.ceil((state.taskDeadline - Date.now()) / 1000));
+  }
+
+  function startTaskTimer() {
+    clearTaskTimer();
+    if (state.taskDeadline === null) {
+      state.taskStartedAt = Date.now();
+      state.taskDeadline = state.taskStartedAt + (Number(config.TASK_DURATION_SECONDS) || 720) * 1000;
+      state.taskTiming.startedAt = new Date(state.taskStartedAt).toISOString();
+      state.taskTiming.plannedSeconds = Number(config.TASK_DURATION_SECONDS) || 720;
+    }
+    state.taskExpired = false;
+    updateTaskTimer();
+    if (!state.taskExpired) state.timerId = window.setInterval(updateTaskTimer, 250);
+    persistSession();
+  }
+
+  function updateTaskTimer() {
+    if (!["chat", "writing"].includes(state.currentScreen) || state.taskDeadline === null) return;
+    state.secondsRemaining = remainingSeconds();
+    const timer = document.getElementById("task-timer");
+    if (timer) timer.textContent = formatTime(state.secondsRemaining);
+    const text = document.getElementById("task-notice-text");
+    if (state.secondsRemaining === 0) {
+      expireTask();
+    } else if (state.secondsRemaining <= 30) {
+      document.getElementById("task-notice").dataset.phase = "last-seconds";
+      const notice = "时间提醒 · 还剩 30 秒以内。可以继续表达正在说的这一点；到时内容会保存，由你确认进入后测。";
+      if (text.textContent !== notice) text.textContent = notice;
+    } else if (state.secondsRemaining <= 120) {
+      document.getElementById("task-notice").dataset.phase = "closing";
+      const notice = "时间提醒 · 还剩 2 分钟以内。继续当前这一点即可，不需要现在得出结论；到时会再次提醒。";
+      if (text.textContent !== notice) text.textContent = notice;
+    }
+  }
+
+  function clearTaskTimer() {
+    if (state.timerId) {
+      window.clearInterval(state.timerId);
+      state.timerId = null;
+    }
+  }
+
+  function captureTaskDrafts() {
+    document.querySelectorAll(".writing-input").forEach((input) => {
+      state.writing[input.id] = input.value;
+    });
+    const input = document.getElementById("chat-input");
+    if (input) state.chatDraft = input.value;
+    if (input?.value.trim()) state.taskTiming.unsentDraft = input.value.trim();
+  }
+
+  function expireTask() {
+    if (state.taskExpired) return;
+    state.taskExpired = true;
+    clearTaskTimer();
+    captureTaskDrafts();
+    state.taskTiming.endedAt = new Date(state.taskDeadline).toISOString();
+    state.taskTiming.actualSeconds = state.taskTiming.plannedSeconds;
+    state.taskTiming.endReason = "time_limit";
+    state.chatController?.abort();
+    setChatEnabled(false);
+    document.querySelectorAll(".writing-input").forEach((input) => { input.disabled = true; });
+    const retry = document.getElementById("retry-chat");
+    if (retry) retry.hidden = true;
+    ["finish-chat", "finish-writing"].forEach((id) => {
+      const button = document.getElementById(id);
+      if (button) button.textContent = "进入后测";
+    });
+    document.getElementById("task-notice").dataset.phase = "ended";
+    document.getElementById("task-notice-text").textContent = "本次文字任务已到时间，你的内容已暂存。准备好后进入后测；若仍想表达或感到不适，请告诉现场研究者。";
+    const postButton = document.getElementById("go-posttest");
+    postButton.hidden = false;
+    postButton.onclick = finishTask;
+    showTaskEndDialog(true);
+    persistSession();
+  }
+
+  function showTaskEndDialog(expired = false) {
+    earlyEndStep = 0;
+    document.getElementById("task-dialog-check-wrap").hidden = true;
+    document.getElementById("task-dialog-check").checked = false;
+    document.getElementById("task-dialog-support").hidden = !expired;
+    document.getElementById("task-dialog-confirm").disabled = false;
+    document.getElementById("task-dialog-confirm").textContent = expired ? "进入后测" : "下一步确认";
+    document.getElementById("task-dialog-title").textContent = expired ? "本次文字任务已到时间" : "准备提前结束文字任务吗？";
+    document.getElementById("task-dialog-text").textContent = expired
+      ? "本次任务的内容已暂存。尚未说完的部分不需要强行得出结论。如果你仍想表达，或这次回忆让你更难受，请告诉现场研究者。你可以先查看刚才的内容，再确认进入后测。"
+      : "提前结束会停止本次文字任务并进入后测，之后不能返回继续任务。你也可以取消，继续表达。";
+    document.getElementById("task-dialog-back").textContent = expired ? "查看刚才内容" : "继续任务";
+    if (exitDialog.open) exitDialog.close();
+    if (!taskDialog.open) taskDialog.showModal();
+  }
+
+  function renderChat() {
+    renderShell(`
+      <section class="workspace" aria-labelledby="chat-title">
+        <header class="workspace__header">
+          <div class="workspace__title">
+            <p>文字任务</p>
+            <h2 id="chat-title">文字对话</h2>
+          </div>
+          <div class="workspace__actions">
+            ${timerMarkup()}
+            <button class="button button--ghost" type="button" data-exit>退出实验</button>
+          </div>
+        </header>
+        ${taskNoticeMarkup()}
+        <div class="workspace__body chat-body" id="chat-body">
+          <div class="message-list" id="message-list" aria-live="polite" aria-relevant="additions"></div>
+        </div>
+        <footer class="chat-composer">
+          <form id="chat-form">
+            <div class="composer-box">
+              <label class="sr-only" for="chat-input">输入你想说的内容</label>
+              <textarea id="chat-input" rows="1" maxlength="2000" placeholder="写下你此刻愿意表达的内容" disabled></textarea>
+              <button class="send-button" type="submit" aria-label="发送" disabled>
+                <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M4 12 20 4l-5.6 16-3.1-6.1L4 12Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+            <p class="composer-hint">Enter 发送，Shift + Enter 换行。请勿填写真实姓名或联系方式。</p>
+            <p class="error-note" id="chat-error"></p>
+          </form>
+          <div class="chat-controls">
+            <button class="button button--secondary" type="button" id="retry-chat" hidden>重试这条消息</button>
+            <button class="button button--ghost" type="button" id="finish-chat">提前结束文字任务</button>
+          </div>
+        </footer>
+      </section>
+    `);
+    bindExitButtons();
+    bindChatEvents();
+    state.messages.forEach((message) => appendMessage(message.role, message.content));
+    document.getElementById("chat-input").value = state.chatDraft;
+    if (state.taskDeadline !== null) startTaskTimer();
+    if (state.taskExpired) return;
+    if (state.pendingChat) {
+      showError("离开前有一条回复尚未完成。你的输入已保留，可以点击重试继续。", "chat-error");
+      document.getElementById("retry-chat").hidden = false;
+    } else if (state.messages.length) setChatEnabled(true);
+    else beginAiSession();
+  }
+
+  function bindChatEvents() {
+    const input = document.getElementById("chat-input");
+    input.addEventListener("input", () => {
+      input.style.height = "auto";
+      input.style.height = `${Math.min(input.scrollHeight, 100)}px`;
+    });
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        document.getElementById("chat-form").requestSubmit();
+      }
+    });
+    document.getElementById("chat-form").addEventListener("submit", sendChatMessage);
+    document.getElementById("finish-chat").addEventListener("click", () => showTaskEndDialog(state.taskExpired));
+    document.getElementById("retry-chat").addEventListener("click", requestChatReply);
+  }
+
+  function setChatEnabled(enabled) {
+    const input = document.getElementById("chat-input");
+    const button = document.querySelector(".send-button");
+    if (!input || !button) return;
+    const canSend = enabled && !state.taskExpired && !state.chatBusy && !state.pendingChat;
+    input.disabled = !canSend;
+    button.disabled = !canSend;
+    if (canSend) input.focus();
+  }
+
+  function scrollChatToBottom() {
+    const body = document.getElementById("chat-body");
+    if (body) body.scrollTop = body.scrollHeight;
+  }
+
+  function appendMessage(role, text) {
+    const list = document.getElementById("message-list");
+    const message = document.createElement("article");
+    message.className = `message message--${role}`;
+    const bubble = document.createElement("div");
+    bubble.className = "message__bubble";
+    bubble.textContent = text;
+    message.append(bubble);
+    if (role === "user") {
+      const meta = document.createElement("span");
+      meta.className = "message__meta";
+      meta.textContent = "你";
+      message.append(meta);
+    }
+    list.append(message);
+    scrollChatToBottom();
+    return message;
+  }
+
+  function appendThinking() {
+    const wrapper = appendMessage("assistant", "");
+    wrapper.id = "thinking-message";
+    wrapper.querySelector(".message__bubble").innerHTML = `
+      <span class="thinking" aria-label="正在生成回复"><span></span><span></span><span></span></span>`;
+    return wrapper;
+  }
+
+  async function streamChatRequest(endpoint, payload, onDelta, signal) {
+    const response = await fetch(apiUrl(endpoint), {
+      method: "POST", headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: JSON.stringify(payload), signal,
+    });
+    if (!response.ok) {
+      let detail;
+      try { detail = (await response.json()).error; } catch (_) {}
+      const error = new Error(detail?.message || `请求失败 ${response.status}`);
+      error.requestId = response.headers.get("X-Request-ID");
+      throw error;
+    }
+    if (!response.headers.get("Content-Type")?.includes("text/event-stream") || !response.body) {
+      throw new Error("当前后端尚未支持流式对话，请联系现场研究者更新后端。");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let result = null;
+    function consume(frame) {
+      let event = "message";
+      const data = [];
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event:")) event = line.slice(6).trim();
+        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+      }
+      if (!data.length) return;
+      const parsed = JSON.parse(data.join("\n"));
+      if (event === "delta") onDelta(parsed.text || "");
+      if (event === "done") result = parsed;
+      if (event === "error") {
+        const error = new Error(parsed.message);
+        error.requestId = parsed.requestId;
+        throw error;
+      }
+    }
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+        buffer = buffer.replace(/\r\n/g, "\n");
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          consume(buffer.slice(0, boundary));
+          buffer = buffer.slice(boundary + 2);
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) consume(buffer);
+      if (!result?.reply || typeof result.reply !== "string") throw new Error("回复传输中断，请重试原消息。");
+      return result;
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
+
+  async function beginAiSession() {
+    if (state.previewMode || (isLocalPreview() && !config.API_BASE)) {
+      showError("当前为界面预览，请从首页使用研究者提供的编号开始完整流程。", "chat-error");
+      return;
+    }
+    state.pendingChat = { start: true };
+    await requestChatReply();
+  }
+
+  async function sendChatMessage(event) {
+    event.preventDefault();
+    if (state.chatBusy || state.pendingChat || state.taskExpired) return;
+    if (remainingSeconds() === 0) { expireTask(); return; }
+    const input = document.getElementById("chat-input");
+    const content = input.value.trim();
+    if (!content) return;
+    input.value = "";
+    input.style.height = "auto";
+    state.messages.push({ role: "user", content });
+    appendMessage("user", content);
+    state.pendingChat = { start: false, turnNumber: state.messages.filter((message) => message.role === "user").length };
+    await requestChatReply();
+  }
+
+  async function requestChatReply() {
+    if (state.chatBusy || state.taskExpired || !state.pendingChat || state.currentScreen !== "chat") return;
+    if (remainingSeconds() === 0) { expireTask(); return; }
+    state.chatBusy = true;
+    persistSession();
+    setChatEnabled(false);
+    const retry = document.getElementById("retry-chat");
+    retry.hidden = true;
+    document.getElementById("chat-error").classList.remove("is-visible");
+    state.pendingChat.messageElement?.remove();
+    const message = appendThinking();
+    state.pendingChat.messageElement = message;
+    let streamedText = "";
+    const controller = new AbortController();
+    state.chatController = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 210000);
+    try {
+      const start = state.pendingChat.start;
+      const payload = { participantId: state.participantId, event: state.event, secondsRemaining: remainingSeconds() };
+      if (!start) {
+        payload.messages = state.messages.slice(-30);
+        payload.turnNumber = state.pendingChat.turnNumber;
+      }
+      const result = await streamChatRequest(
+        start ? config.ENDPOINTS.chatStartStream : config.ENDPOINTS.chatReplyStream,
+        payload,
+        (delta) => {
+          if (state.currentScreen !== "chat" || state.taskExpired) return;
+          if (state.taskDeadline !== null && remainingSeconds() === 0) { expireTask(); return; }
+          const body = document.getElementById("chat-body");
+          const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 90;
+          streamedText += delta;
+          message.querySelector(".message__bubble").textContent = streamedText;
+          if (nearBottom) scrollChatToBottom();
+        },
+        controller.signal,
+      );
+      if (state.currentScreen !== "chat" || state.taskExpired) return;
+      if (state.taskDeadline !== null && remainingSeconds() === 0) { expireTask(); return; }
+      message.removeAttribute("id");
+      message.querySelector(".message__bubble").textContent = result.reply;
+      state.messages.push({ role: "assistant", content: result.reply });
+      state.pendingChat = null;
+      persistSession();
+      if (result.action === "stop") {
+        state.taskTiming.endReason = "safety_stop";
+        navigate("support");
+        return;
+      }
+      if (start) startTaskTimer();
+    } catch (error) {
+      if (!streamedText) message.remove();
+      else {
+        message.classList.add("message--incomplete");
+        const note = document.createElement("span");
+        note.className = "message__meta";
+        note.textContent = state.taskExpired ? "任务到时，回复已暂停" : "回复未完整生成";
+        message.append(note);
+      }
+      if (state.currentScreen !== "chat" || state.taskExpired) return;
+      const reference = error.requestId ? `（错误编号 ${error.requestId}）` : "";
+      showError(`这条回复未能完成。你的输入已保留，点击“重试这条消息”即可，无需重复输入。${reference}`, "chat-error");
+      retry.hidden = false;
+    } finally {
+      window.clearTimeout(timeout);
+      if (state.chatController === controller) state.chatController = null;
+      state.chatBusy = false;
+      if (state.currentScreen === "chat") setChatEnabled(true);
+    }
+  }
+
+  function renderWriting() {
+    const prompts = [
+      {
+        title: "这件事发生了什么？",
+        detail: "请写下你认为必要的经过。你可以从事情开始的地方写起，也可以直接写最让你在意的部分。",
+        placeholder: "在这里记录事情的经过",
+      },
+      {
+        title: "你最反复想到的内容是什么？",
+        detail: "可以写下一句话、一个画面或某个反复出现的片段。",
+        placeholder: "在这里记录反复出现的内容",
+      },
+      {
+        title: "这件事带来了哪些感受？",
+        detail: "请按你愿意的程度描述。你可以写一种感受，也可以写几种同时出现的感受。",
+        placeholder: "在这里记录你的感受",
+      },
+      {
+        title: "这件事目前怎样影响你？",
+        detail: "可以写它对情绪、注意力或日常安排的影响。如果没有明显影响，也可以如实写下。",
+        placeholder: "在这里记录它目前带来的影响",
+      },
+    ];
+
+    renderShell(`
+      <section class="workspace" aria-labelledby="writing-title">
+        <header class="workspace__header">
+          <div class="workspace__title">
+            <p>文字任务</p>
+            <h2 id="writing-title">文字记录</h2>
+          </div>
+          <div class="workspace__actions">
+            ${timerMarkup()}
+            <button class="button button--ghost" type="button" data-exit>退出实验</button>
+          </div>
+        </header>
+        ${taskNoticeMarkup()}
+        <div class="workspace__body writing-body">
+          <p class="writing-intro">请按自己的节奏完成四段文字记录。每一部分篇幅不限，也可以返回修改。页面不会评价、解释或回应你写下的内容。</p>
+          <div class="writing-grid">
+            ${prompts
+              .map(
+                (prompt, index) => `
+                  <section class="writing-card">
+                    <h3>${index + 1}. ${prompt.title}</h3>
+                    <p>${prompt.detail}</p>
+                    <label class="sr-only" for="writing-${index + 1}">${prompt.title}</label>
+                    <textarea class="text-area writing-input" id="writing-${index + 1}" maxlength="3000" placeholder="${prompt.placeholder}"></textarea>
+                    <div class="save-state" id="writing-${index + 1}-status" aria-live="polite"></div>
+                  </section>
+                `,
+              )
+              .join("")}
+            <section class="writing-card">
+              <h3>自由补充</h3>
+              <p>如果还有愿意补充的内容，可以继续写在这里。这一部分可以留空。</p>
+              <label class="sr-only" for="writing-extra">自由补充</label>
+              <textarea class="text-area writing-input" id="writing-extra" maxlength="3000" placeholder="选填"></textarea>
+              <div class="save-state" id="writing-extra-status" aria-live="polite"></div>
+            </section>
+          </div>
+        </div>
+        <footer class="workspace__footer">
+          <span class="form-hint">请勿填写真实姓名、学校、地址或联系方式。</span>
+          <button class="button button--primary" type="button" id="finish-writing">提前结束文字任务</button>
+        </footer>
+      </section>
+    `);
+
+    bindExitButtons();
+    document.querySelectorAll(".writing-input").forEach((input) => {
+      input.value = state.writing[input.id] || "";
+      let statusTimer;
+      input.addEventListener("input", () => {
+        window.clearTimeout(statusTimer);
+        const status = document.getElementById(`${input.id}-status`);
+        status.textContent = "正在暂存";
+        statusTimer = window.setTimeout(() => {
+          state.writing[input.id] = input.value;
+          status.textContent = state.storageAvailable ? "已暂存于本浏览器" : "暂存不可用，请保持页面打开";
+        }, 350);
+      });
+    });
+    document.getElementById("finish-writing").addEventListener("click", () => {
+      document.querySelectorAll(".writing-input").forEach((input) => {
+        state.writing[input.id] = input.value;
+      });
+      showTaskEndDialog(state.taskExpired);
+    });
+    startTaskTimer();
+  }
+
+  function finishTask() {
+    captureTaskDrafts();
+    clearTaskTimer();
+    if (!state.taskTiming.endedAt) {
+      state.taskTiming.endedAt = new Date().toISOString();
+      state.taskTiming.actualSeconds = state.taskStartedAt === null ? 0 : Math.round((Date.now() - state.taskStartedAt) / 1000);
+      state.taskTiming.endReason = "participant_finished";
+    }
+    state.taskTiming.posttestStartedAt = new Date().toISOString();
+    state.posttest.taskTiming = { ...state.taskTiming };
+    navigate("bsri-post");
+  }
+
+  function likertQuestion(group, index, text) {
+    return `
+      <div class="likert-row">
+        <p class="likert-row__text">${index + 1}. ${text}</p>
+        <div>
+          <div class="likert-options" role="radiogroup" aria-label="${escapeHtml(text)}">
+            ${Array.from({ length: 7 }, (_, value) => value + 1)
+              .map(
+                (value) => `
+                  <label class="likert-option">
+                    <input type="radio" name="${group}-${index}" value="${value}" required />
+                    <span>${value}</span>
+                  </label>
+                `,
+              )
+              .join("")}
+          </div>
+          <div class="likert-labels"><span>非常不同意</span><span>非常同意</span></div>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderUsability() {
+    const conditionItems = state.condition === "ai" ? aiExperienceItems : writingExperienceItems;
+    renderShell(`
+      <div class="page-title">
+        <p class="eyebrow">后测 · 使用体验</p>
+        <h2>刚才的页面使用感受</h2>
+        <p class="lead">以下问题只了解页面和任务体验，不会影响参与报酬。</p>
+      </div>
+      <form class="card" id="usability-form">
+        <div class="card__body">
+          <section aria-labelledby="common-usability-title">
+            <h3 id="common-usability-title">页面使用</h3>
+            <div class="scale-block">
+              ${commonUsabilityItems.map((item, index) => likertQuestion("common", index, item)).join("")}
+            </div>
+          </section>
+          <section aria-labelledby="task-experience-title" style="margin-top: 2rem">
+            <h3 id="task-experience-title">任务体验</h3>
+            <div class="scale-block">
+              ${conditionItems.map((item, index) => likertQuestion("condition", index, item)).join("")}
+            </div>
+          </section>
+          <section aria-labelledby="safety-title" style="margin-top: 2rem">
+            <h3 id="safety-title">当前状态</h3>
+            <div class="section-stack" style="margin-top: 1rem">
+              <div class="question-card">
+                <p class="form-label">与任务开始前相比，这次任务是否让你的困扰明显加重？</p>
+                <div class="button-row">
+                  ${["没有", "有一点", "明显加重", "非常明显地加重"]
+                    .map(
+                      (label) => `
+                        <label class="choice" style="flex: 1 1 150px">
+                          <input type="radio" name="distress-change" value="${label}" required />
+                          <span><strong>${label}</strong></span>
+                        </label>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </div>
+              <div class="question-card">
+                <p class="form-label">任务过程中，你是否有过想停止，却感到自己不能停止的情况？</p>
+                <div class="button-row">
+                  ${["没有", "有"]
+                    .map(
+                      (label) => `
+                        <label class="choice" style="flex: 1 1 160px">
+                          <input type="radio" name="felt-unable-to-stop" value="${label}" required />
+                          <span><strong>${label}</strong></span>
+                        </label>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </div>
+              <div class="question-card">
+                <p class="form-label">此刻，你是否觉得自己的状态稳定，可以结束本次实验？</p>
+                <div class="button-row">
+                  ${["是", "否", "不确定"]
+                    .map(
+                      (label) => `
+                        <label class="choice" style="flex: 1 1 130px">
+                          <input type="radio" name="stable" value="${label}" required />
+                          <span><strong>${label}</strong></span>
+                        </label>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </div>
+              <div class="question-card">
+                <p class="form-label">此刻，你是否希望与现场研究者单独沟通？</p>
+                <div class="button-row">
+                  ${["希望", "暂时不需要"]
+                    .map(
+                      (label) => `
+                        <label class="choice" style="flex: 1 1 160px">
+                          <input type="radio" name="contact-researcher" value="${label}" required />
+                          <span><strong>${label}</strong></span>
+                        </label>
+                      `,
+                    )
+                    .join("")}
+                </div>
+              </div>
+              <div class="form-field">
+                <label class="form-label" for="open-feedback">刚才的任务中，哪一个部分对你最有帮助、最不舒服或最难使用？</label>
+                <textarea class="text-area" id="open-feedback" maxlength="1000" placeholder="选填，请勿填写可以识别你身份的信息"></textarea>
+              </div>
+            </div>
+          </section>
+          <p class="error-note" id="usability-error"></p>
+          <div class="button-row">
+            <button class="button button--primary" type="submit">提交并结束</button>
+          </div>
+        </div>
+      </form>
+    `);
+
+    document.getElementById("usability-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const formData = new FormData(event.currentTarget);
+      state.posttest.usability = Object.fromEntries(formData.entries());
+      state.posttest.openFeedback = document.getElementById("open-feedback").value.trim();
+      const stable = formData.get("stable");
+      const contact = formData.get("contact-researcher");
+      navigate(stable === "是" && contact === "暂时不需要" ? "complete" : "support");
+    });
+  }
+
+  function renderComplete() {
+    renderShell(`
+      <section class="completion">
+        <div class="completion-card">
+          <div class="completion-mark" aria-hidden="true"></div>
+          <p class="eyebrow">本次实验已完成</p>
+          <h2>感谢你的参与</h2>
+          <p>你的回答将以参与者编号保存。为避免影响后续随访，本页暂不说明不同文字任务对应的具体研究假设。</p>
+          <div class="completion-card__divider"></div>
+          <h3>离开前</h3>
+          <p>刚才的回忆和书写可能让某些感受暂时变得更明显。你可以先停留一会儿，喝水，看看周围的环境，等状态稳定后再离开。</p>
+          <p>研究者将在约三天后按知情同意书中的方式邀请你完成简短随访问卷。</p>
+          <div class="button-row" style="justify-content: center">
+            <button class="button button--primary" type="button" id="confirm-finish">确认结束</button>
+            <button class="button button--secondary" type="button" id="contact-researcher">我想联系现场研究者</button>
+          </div>
+          <p class="error-note" id="completion-error"></p>
+        </div>
+      </section>
+    `);
+
+    document.getElementById("confirm-finish").addEventListener("click", () => saveCompletion("complete", "confirm-finish", "completion-error", "已完成"));
+    document.getElementById("contact-researcher").addEventListener("click", () => navigate("support"));
+  }
+
+  function renderSupport() {
+    renderShell(`
+      <section class="completion">
+        <div class="completion-card">
+          <p class="eyebrow">实验已暂停</p>
+          <h2>请先与现场研究者联系</h2>
+          <p>你不需要继续回答问题，也不需要向网页说明更多细节。请留在当前页面，并告知现场研究者。</p>
+          <p>现场研究者会按照已经审核的流程与你确认当前情况，并一起决定接下来是否需要其他支持。</p>
+          <div class="completion-card__divider"></div>
+          <p>暂停或退出不会影响你已经享有的参与者权利，报酬安排以知情同意书为准。</p>
+          <div class="button-row" style="justify-content: center">
+            <button class="button button--primary" type="button" id="notify-researcher">记录支持请求</button>
+          </div>
+          <p class="error-note" id="support-error"></p>
+        </div>
+      </section>
+    `);
+    document.getElementById("notify-researcher").addEventListener("click", () => saveCompletion("support_requested", "notify-researcher", "support-error", "已记录请求，请当面告知研究者"));
+  }
+
+  function renderWithdrawn() {
+    renderShell(`
+      <section class="completion">
+        <div class="completion-card">
+          <p class="eyebrow">流程已结束</p>
+          <h2>你的选择已确认</h2>
+          <p>本次实验流程已结束，网页不会继续文字任务。</p>
+          <div class="completion-card__divider"></div>
+          <p>如果你是在实验过程中退出，请联系现场研究者了解后续安排。</p>
+          ${state.participantId ? '<button class="button button--secondary" type="button" id="save-withdrawal">保存退出记录</button><p class="error-note" id="withdrawal-error"></p>' : ''}
+        </div>
+      </section>
+    `);
+    const button = document.getElementById("save-withdrawal");
+    if (button) button.onclick = () => saveCompletion("withdrawn", "save-withdrawal", "withdrawal-error", "退出记录已保存");
+  }
+
+  async function submitCompletion(status) {
+    if (state.previewMode || (isLocalPreview() && !config.API_BASE)) return;
+    await apiRequest(config.ENDPOINTS.complete, {
+      participantId: state.participantId,
+      status,
+      condition: state.condition,
+      event: state.event,
+      pretest: state.pretest,
+      posttest: { ...state.posttest, taskTiming: { ...state.taskTiming } },
+      writing: state.condition === "writing" || state.taskTiming.migratedFromWritingAt ? state.writing : undefined,
+    });
+    state.submitted = true;
+    clearSession();
+  }
+
+  async function saveCompletion(status, buttonId, errorId, label) {
+    const button = document.getElementById(buttonId);
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "正在保存…";
+    try { await submitCompletion(status); button.textContent = label; }
+    catch (_) {
+      button.disabled = false;
+      button.textContent = original;
+      showError("暂时未能保存提交，进度已留在本浏览器。请检查网络后重试，或联系现场研究者。", errorId);
+      persistSession();
+    }
+  }
+
+  function bindExitButtons() {
+    document.querySelectorAll("[data-exit]").forEach((button) => {
+      button.addEventListener("click", () => {
+        document.getElementById("exit-check").checked = false;
+        exitDialog.querySelector("[data-confirm-exit]").disabled = true;
+        exitDialog.showModal();
+      });
+    });
+  }
+
+  function bindDialog() {
+    document.getElementById("task-dialog-support").addEventListener("click", () => navigate("support"));
+    document.getElementById("task-dialog-back").addEventListener("click", () => taskDialog.close());
+    document.getElementById("task-dialog-confirm").addEventListener("click", () => {
+      if (state.taskExpired) { finishTask(); return; }
+      if (earlyEndStep === 0) {
+        earlyEndStep = 1;
+        document.getElementById("task-dialog-title").textContent = "再次确认提前结束";
+        document.getElementById("task-dialog-text").textContent = "确认后，剩余时间将不再用于本次文字任务。若是误点，请选择继续任务。";
+        document.getElementById("task-dialog-check-wrap").hidden = false;
+        document.getElementById("task-dialog-confirm").textContent = "确认提前结束并进入后测";
+        document.getElementById("task-dialog-confirm").disabled = true;
+        document.getElementById("task-dialog-check").focus();
+      } else if (document.getElementById("task-dialog-check").checked) finishTask();
+    });
+    document.getElementById("task-dialog-check").addEventListener("change", (event) => {
+      document.getElementById("task-dialog-confirm").disabled = !event.target.checked;
+    });
+    document.getElementById("exit-check").addEventListener("change", (event) => {
+      exitDialog.querySelector("[data-confirm-exit]").disabled = !event.target.checked;
+    });
+    document.addEventListener("input", persistSession);
+    document.addEventListener("change", persistSession);
+    window.addEventListener("pagehide", persistSession);
+    document.addEventListener("visibilitychange", () => {
+      persistSession();
+      if (!document.hidden) updateTaskTimer();
+    });
+    exitDialog.querySelector("[data-dialog-close]").addEventListener("click", () => exitDialog.close());
+    exitDialog.querySelector("[data-confirm-exit]").addEventListener("click", () => {
+      exitDialog.close();
+      navigate("withdrawn");
+      saveCompletion("withdrawn", "save-withdrawal", "withdrawal-error", "退出记录已保存");
+    });
+    exitDialog.addEventListener("click", (event) => {
+      if (event.target === exitDialog) exitDialog.close();
+    });
+  }
+
+  function applyPreviewRoute() {
+    const preview = new URLSearchParams(window.location.search).get("preview");
+    const routes = {
+      home: "home",
+      consent: "consent",
+      event: "event",
+      pretest: "bsri-pre",
+      chat: "chat",
+      writing: "writing",
+      posttest: "bsri-post",
+      usability: "usability",
+      complete: "complete",
+      support: "support",
+    };
+    if (!preview || !routes[preview]) return false;
+    state.previewMode = true;
+    if (preview === "chat") state.condition = "ai";
+    if (preview === "writing") state.condition = "writing";
+    if (preview === "usability" && !state.condition) state.condition = "ai";
+    state.currentScreen = routes[preview];
+    return true;
+  }
+
+  function renderCurrentScreen() {
+    switch (state.currentScreen) {
+      case "home":
+        renderHome();
+        break;
+      case "consent":
+        renderConsent();
+        break;
+      case "event":
+        renderEventRecall();
+        break;
+      case "bsri-pre":
+        renderBsri("pre");
+        break;
+      case "event-pre":
+        renderEventMeasures("pre");
+        break;
+      case "assigning":
+        renderAssigning();
+        break;
+      case "chat":
+        renderChat();
+        break;
+      case "writing":
+        renderWriting();
+        break;
+      case "bsri-post":
+        renderBsri("post");
+        break;
+      case "event-post":
+        renderEventMeasures("post");
+        break;
+      case "usability":
+        renderUsability();
+        break;
+      case "complete":
+        renderComplete();
+        break;
+      case "support":
+        renderSupport();
+        break;
+      case "withdrawn":
+        renderWithdrawn();
+        break;
+      default:
+        renderHome();
+    }
+    restoreFormDrafts();
+    persistSession();
+  }
+
+  bindDialog();
+  if (!applyPreviewRoute()) recoverySnapshot = loadSession();
+  if (recoverySnapshot) renderRecovery();
+  else renderCurrentScreen();
+})();
