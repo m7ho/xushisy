@@ -43,6 +43,7 @@
   const state = {
     participantId: "",
     accountName: "",
+    isAdmin: false,
     roundId: null,
     consentVersion: "",
     consentReusable: false,
@@ -158,7 +159,7 @@
       const button = document.getElementById("resume-session");
       button.disabled = true;
       const saved = recoverySnapshot.state;
-      if (config.ASSIGNMENT_MODE === "pilot_ai" && saved.currentScreen === "writing") {
+      if (!state.isAdmin && config.ASSIGNMENT_MODE === "pilot_ai" && saved.currentScreen === "writing") {
         try {
           const assignment = await apiRequest(config.ENDPOINTS.randomize, { participantId: saved.participantId });
           if (assignment.condition !== "ai") throw new Error("预实验分组尚未开启");
@@ -280,10 +281,10 @@
     renderDashboard();
   }
 
-  function resetParticipant(participantId, accountName = participantId) {
+  function resetParticipant(participantId, accountName = participantId, isAdmin = false) {
     clearTaskTimer();
     state.chatController?.abort();
-    Object.assign(state, JSON.parse(initialState), { participantId, accountName });
+    Object.assign(state, JSON.parse(initialState), { participantId, accountName, isAdmin: isAdmin === true });
     recoverySnapshot = null;
   }
 
@@ -302,7 +303,7 @@
     try {
       const session = await apiRequest(config.ENDPOINTS.session);
       if (authToken !== checkedToken) return;
-      resetParticipant(session.participantId, session.username || session.participantId);
+      resetParticipant(session.participantId, session.username || session.participantId, session.isAdmin);
       enterAuthenticated();
     } catch (_) { if (authToken === checkedToken) clearAuth(); }
   }
@@ -310,7 +311,7 @@
   function renderHeader(showParticipant = true) {
     const participant =
       showParticipant && state.participantId
-        ? `<span class="participant-pill">实验账号 ${escapeHtml(state.accountName || state.participantId)}${state.roundId ? ` · 第 ${state.roundId} 次` : ""}</span>`
+        ? `<span class="participant-pill">${state.isAdmin ? "管理员测试账号" : "实验账号"} ${escapeHtml(state.accountName || state.participantId)}${state.roundId ? ` · 第 ${state.roundId} 次` : ""}</span>`
         : "";
 
     return `
@@ -473,7 +474,7 @@
         const result = await apiRequest(config.ENDPOINTS.login, { username: participantId, password: password.value });
         password.value = "";
         authToken = result.token;
-        resetParticipant(result.participantId, result.username || result.participantId);
+        resetParticipant(result.participantId, result.username || result.participantId, result.isAdmin);
         try { window.localStorage.setItem(AUTH_KEY, JSON.stringify(result)); } catch (_) {}
         enterAuthenticated();
       } catch (error) {
@@ -488,7 +489,7 @@
     const dashboardPid = state.participantId;
     const dashboardToken = authToken;
     state.roundId = null;
-    renderShell(`<section class="card"><div class="card__body"><h2>我的文字任务</h2><p id="rounds-summary">正在读取任务记录…</p><div id="rounds-actions"></div><p class="error-note" id="rounds-error"></p></div></section>
+    renderShell(`<section class="card"><div class="card__body"><h2>${state.isAdmin ? "管理员网页测试" : "我的文字任务"}</h2>${state.isAdmin ? '<p class="status-note is-visible">每轮开始前可自行选择组别。此账号的数据标记为测试，默认不进入研究数据导出。</p>' : ''}<p id="rounds-summary">正在读取任务记录…</p><div id="rounds-actions"></div><p class="error-note" id="rounds-error"></p></div></section>
       <section class="card password-card"><div class="card__body">
         <h3>账号设置</h3>
         <button class="button button--secondary" type="button" id="show-password-form" aria-expanded="false" aria-controls="password-form">修改密码</button>
@@ -515,25 +516,39 @@
       const labels = { active: "进行中", complete: "已完成", withdrawn: "已退出", support_requested: "请联系研究者" };
       for (const r of rounds.slice(-8)) {
         const item = document.createElement("li");
-        item.textContent = `第 ${r.round_id} 次 · ${labels[r.status] || r.status}`;
+        item.textContent = `第 ${r.round_id} 次 · ${labels[r.status] || r.status}${state.isAdmin && r.condition ? ` · ${r.condition === "ai" ? "AI叙事外化组" : "文字记录组"}` : ""}`;
         history.append(item);
       }
       actions.append(history);
-      if (!active && last?.status === "support_requested") {
+      if (!state.isAdmin && !active && last?.status === "support_requested") {
         document.getElementById("rounds-summary").textContent = "请先联系现场研究者，暂不开始新一轮任务。";
         return;
       }
       const button = document.createElement("button");
       button.className = "button button--primary";
       button.type = "button";
-      button.textContent = active ? `继续第 ${active.round_id} 次任务` : `开始第 ${rounds.length + 1} 次任务`;
+      if (state.isAdmin && !active) {
+        const choice = document.createElement("div");
+        choice.className = "form-field admin-group-choice";
+        choice.innerHTML = '<label class="form-label" for="admin-condition">本轮测试组别</label><select class="text-input" id="admin-condition"><option value="">请选择要测试的组别</option><option value="ai">AI叙事外化组</option><option value="writing">文字记录组（对照组）</option></select>';
+        actions.append(choice);
+      }
+      const taskName = state.isAdmin ? "测试" : "任务";
+      button.textContent = active ? `继续第 ${active.round_id} 次${taskName}` : `开始第 ${rounds.length + 1} 次${taskName}`;
       button.onclick = async () => {
+        const choice = document.getElementById("admin-condition");
+        if (choice && !choice.value) {
+          showError("请先选择本轮要测试的组别。", "rounds-error");
+          choice.focus();
+          return;
+        }
         button.disabled = true;
+        if (choice) choice.disabled = true;
         try {
-          const result = await apiRequest(config.ENDPOINTS.startRound, {});
+          const result = await apiRequest(config.ENDPOINTS.startRound, choice ? { condition: choice.value } : {});
           if (state.participantId !== dashboardPid || authToken !== dashboardToken) return;
           if (result.consentVersion !== config.CONSENT_VERSION) throw new Error("研究说明版本正在更新，请刷新页面或联系研究者，暂不开始任务。");
-          resetParticipant(dashboardPid, state.accountName);
+          resetParticipant(dashboardPid, state.accountName, state.isAdmin);
           state.roundId = result.round.round_id;
           state.consentVersion = result.consentVersion;
           state.consentReusable = Boolean(result.round.can_reaffirm);
@@ -543,6 +558,7 @@
           else navigate(state.roundConsented ? "event" : "consent");
         } catch (error) {
           button.disabled = false;
+          if (choice) choice.disabled = false;
           showError(error.message, "rounds-error");
         }
       };
