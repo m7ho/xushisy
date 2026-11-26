@@ -1,6 +1,13 @@
 window.EXPERIMENT_CONFIG = {
   API_BASE: "https://xushisy-ehalvmnbmx.cn-hongkong.fcapp.run",
   ENDPOINTS: {
+    login: "/api/auth/login",
+    session: "/api/auth/session",
+    logout: "/api/auth/logout",
+    changePassword: "/api/auth/password",
+    rounds: "/api/rounds",
+    startRound: "/api/rounds/start",
+    consent: "/api/consent",
     randomize: "/api/randomize",
     chatStart: "/api/chat/start",
     chatReply: "/api/chat",
@@ -12,5 +19,6 @@ window.EXPERIMENT_CONFIG = {
   },
   TASK_DURATION_SECONDS: 12 * 60,
   ENABLE_LOCAL_PREVIEW: true,
-  ASSIGNMENT_MODE: "pilot_ai",
+  ASSIGNMENT_MODE: "randomized",
+  CONSENT_VERSION: "2026-10-16-v1",
 };

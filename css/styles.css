@@ -672,6 +672,14 @@ h3 {
   background: var(--teal-050);
 }
 
+.password-card {
+  margin-top: 1.25rem;
+}
+
+#password-form {
+  max-width: 36rem;
+}
+
 .loading-screen {
   display: grid;
   min-height: 55vh;
@@ -1362,6 +1370,9 @@ body.task-screen {
 .task-notice[data-phase="ended"] { border-left: 4px solid #28666d; }
 .confirm-choice { display: flex; gap: .65rem; align-items: flex-start; margin: 1.3rem 0; }
 .confirm-choice input { flex: 0 0 auto; margin-top: .35rem; }
+.site-header__actions { display: flex; min-width: 0; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: .5rem; }
+.site-header__actions .participant-pill { max-width: 100%; overflow-wrap: anywhere; }
+.site-header__actions .button { white-space: nowrap; padding: .3rem .6rem; font-size: .8rem; }
 @media (max-width: 640px), (max-height: 650px) {
   .task-screen .site-header__inner {
     min-height: 46px;

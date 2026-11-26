@@ -42,6 +42,12 @@
 
   const state = {
     participantId: "",
+    accountName: "",
+    roundId: null,
+    consentVersion: "",
+    consentReusable: false,
+    roundConsented: false,
+    resumeAfterConsent: null,
     currentScreen: "home",
     condition: null,
     event: {
@@ -70,29 +76,37 @@
   };
 
   const SESSION_KEY = "xushisy.session.v3";
+  const initialState = JSON.stringify(state);
   const SESSION_TTL = 24 * 60 * 60 * 1000;
+  const AUTH_KEY = "xushisy.auth.v1";
+  let authToken = "";
+  let loginVisible = true;
   let recoverySnapshot = null;
   let earlyEndStep = 0;
 
+  function sessionKey() {
+    return `${SESSION_KEY}:${state.participantId}:round:${state.roundId}`;
+  }
+
   function clearSession() {
-    try { window.localStorage.removeItem(SESSION_KEY); } catch (_) { /* 存储不可用 */ }
+    try { window.localStorage.removeItem(sessionKey()); } catch (_) { /* 存储不可用 */ }
   }
 
   function persistSession() {
-    if (state.previewMode || recoverySnapshot || !state.participantId || state.submitted) return;
+    if (loginVisible || state.previewMode || recoverySnapshot || !state.participantId || state.roundId === null || state.submitted) return;
     captureTaskDrafts();
     const fields = [...app.querySelectorAll("input, textarea, select")]
-      .filter((input) => input.id || input.name)
+      .filter((input) => input.type !== "password" && (input.id || input.name))
       .map((input) => ({ id: input.id, name: input.name, value: input.value,
         checked: input.checked, touched: input.dataset.touched }));
     state.formDrafts[state.currentScreen] = fields;
     const saved = {};
     ["participantId", "currentScreen", "condition", "event", "pretest", "posttest",
       "messages", "writing", "taskDeadline", "taskStartedAt", "taskExpired", "taskTiming",
-      "formDrafts", "chatDraft"].forEach((key) => { saved[key] = state[key]; });
+      "formDrafts", "chatDraft", "roundId", "resumeAfterConsent"].forEach((key) => { saved[key] = state[key]; });
     saved.pendingChat = state.pendingChat ? { start: state.pendingChat.start, turnNumber: state.pendingChat.turnNumber } : null;
     try {
-      window.localStorage.setItem(SESSION_KEY, JSON.stringify({ version: 3, savedAt: Date.now(), state: saved }));
+      window.localStorage.setItem(sessionKey(), JSON.stringify({ version: 3, savedAt: Date.now(), state: saved }));
       state.storageAvailable = true;
     } catch (_) {
       state.storageAvailable = false;
@@ -103,10 +117,11 @@
 
   function loadSession() {
     try {
-      const saved = JSON.parse(window.localStorage.getItem(SESSION_KEY));
+      const saved = JSON.parse(window.localStorage.getItem(sessionKey()) || (state.roundId === 1 ? window.localStorage.getItem(`${SESSION_KEY}:${state.participantId}`) : "null"));
       if (!saved) return null;
       if (saved.version !== 3 || !Number.isFinite(saved.savedAt) || Date.now() - saved.savedAt > SESSION_TTL ||
-          !saved.state?.participantId || !screenStage[saved.state.currentScreen] ||
+          (saved.state?.roundId ?? 1) !== state.roundId ||
+          saved.state?.participantId !== state.participantId || !screenStage[saved.state.currentScreen] ||
           !Array.isArray(saved.state.messages) || !saved.state.formDrafts ||
           (saved.state.taskDeadline !== null && !Number.isFinite(saved.state.taskDeadline))) {
         clearSession(); return null;
@@ -134,7 +149,7 @@
   function renderRecovery() {
     renderShell(`<section class="completion"><div class="completion-card">
       <p class="eyebrow">发现未完成的实验</p><h2>可以从离开的地方继续</h2>
-      <p>本浏览器保存了参与者编号 ${escapeHtml(recoverySnapshot.state.participantId)} 的进度。</p>
+      <p>本浏览器保存了账号 ${escapeHtml(state.accountName)} 第 ${state.roundId} 次任务的进度。</p>
       <p>文字任务的计时会继续按原定截止时间计算，离开页面不会暂停或重置计时。若已到时间，将保留内容并进入结束确认。</p>
       <p>请由这位参与者继续操作。如果不是同一位参与者，或误点了确认退出，请先联系现场研究者。</p>
       <button class="button button--primary" type="button" id="resume-session">恢复原来的进度</button>
@@ -157,7 +172,9 @@
         }
       }
       const savedAt = recoverySnapshot.savedAt;
+      const roundId = state.roundId;
       Object.assign(state, recoverySnapshot.state);
+      state.roundId = roundId;
       recoverySnapshot = null;
       state.chatBusy = false;
       state.chatController = null;
@@ -165,6 +182,13 @@
         resumedAt: new Date().toISOString(), lastSavedAt: new Date(savedAt).toISOString(),
         remainingSeconds: remainingSeconds(),
       }];
+      if (!state.roundConsented && state.currentScreen !== "consent") {
+        state.resumeAfterConsent = state.currentScreen;
+        state.currentScreen = "consent";
+      } else if (state.roundConsented && state.currentScreen === "consent") {
+        state.currentScreen = state.resumeAfterConsent || "event";
+        state.resumeAfterConsent = null;
+      }
       renderCurrentScreen();
     };
   }
@@ -208,23 +232,85 @@
   }
 
   async function apiRequest(endpoint, payload) {
+    const requestToken = authToken;
+    if (payload?.participantId && payload.roundId === undefined && state.roundId !== null) payload = { ...payload, roundId: state.roundId };
     const response = await fetch(apiUrl(endpoint), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      method: payload === undefined ? "GET" : "POST",
+      headers: requestHeaders(),
+      body: payload === undefined ? undefined : JSON.stringify(payload),
     });
 
     if (!response.ok) {
-      throw new Error(`请求失败 ${response.status}`);
+      let detail;
+      try { detail = (await response.json()).error; } catch (_) {}
+      if (response.status === 401 && endpoint !== config.ENDPOINTS.login && requestToken === authToken) requireLogin();
+      const error = new Error(detail?.message || `请求失败 ${response.status}`);
+      error.code = detail?.code;
+      throw error;
     }
 
     return response.json();
   }
 
+  function requestHeaders() {
+    return { "Content-Type": "application/json", ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}) };
+  }
+
+  function clearAuth() {
+    authToken = "";
+    try { window.localStorage.removeItem(AUTH_KEY); } catch (_) {}
+  }
+
+  function requireLogin() {
+    persistSession();
+    clearTaskTimer();
+    state.chatController?.abort();
+    taskDialog.close();
+    exitDialog.close();
+    recoverySnapshot = null;
+    clearAuth();
+    state.currentScreen = "home";
+    renderHome();
+    showError("请重新登录，原来的内容和截止时间仍保留。", "login-error");
+  }
+
+  function enterAuthenticated() {
+    loginVisible = false;
+    state.currentScreen = "dashboard";
+    renderDashboard();
+  }
+
+  function resetParticipant(participantId, accountName = participantId) {
+    clearTaskTimer();
+    state.chatController?.abort();
+    Object.assign(state, JSON.parse(initialState), { participantId, accountName });
+    recoverySnapshot = null;
+  }
+
+  async function boot() {
+    if (isLocalPreview() && applyPreviewRoute()) {
+      loginVisible = false;
+      renderCurrentScreen();
+      return;
+    }
+    renderHome();
+    let saved;
+    try { saved = JSON.parse(window.localStorage.getItem(AUTH_KEY)); } catch (_) {}
+    if (!saved?.token || saved.expiresAt * 1000 <= Date.now()) { clearAuth(); return; }
+    authToken = saved.token;
+    const checkedToken = authToken;
+    try {
+      const session = await apiRequest(config.ENDPOINTS.session);
+      if (authToken !== checkedToken) return;
+      resetParticipant(session.participantId, session.username || session.participantId);
+      enterAuthenticated();
+    } catch (_) { if (authToken === checkedToken) clearAuth(); }
+  }
+
   function renderHeader(showParticipant = true) {
     const participant =
       showParticipant && state.participantId
-        ? `<span class="participant-pill">参与者编号 ${escapeHtml(state.participantId)}</span>`
+        ? `<span class="participant-pill">实验账号 ${escapeHtml(state.accountName || state.participantId)}${state.roundId ? ` · 第 ${state.roundId} 次` : ""}</span>`
         : "";
 
     return `
@@ -234,7 +320,7 @@
             <span class="brand__mark" aria-hidden="true"></span>
             <span class="brand__text">近期事件回忆与文字表达研究</span>
           </div>
-          ${participant}
+          <div class="site-header__actions">${participant}${authToken && !loginVisible ? '<button class="button button--ghost" type="button" id="sign-out">退出登录</button>' : ''}</div>
         </div>
       </header>
     `;
@@ -276,6 +362,13 @@
       </div>
     `;
     window.scrollTo({ top: 0, behavior: "auto" });
+    const signOut = document.getElementById("sign-out");
+    if (signOut) signOut.onclick = async () => {
+      persistSession();
+      try { await apiRequest(config.ENDPOINTS.logout, {}); } catch (_) {}
+      requireLogin();
+      showError("已退出登录。重新使用同一账号登录后，可恢复原进度；任务计时不会暂停。", "login-error");
+    };
   }
 
   function showError(message, id = "page-error") {
@@ -304,6 +397,7 @@
   }
 
   function renderHome() {
+    loginVisible = true;
     renderShell(
       `
         <section class="hero">
@@ -331,25 +425,31 @@
             </div>
             <form id="start-form">
               <div class="form-field">
-                <label class="form-label" for="participant-id">参与者编号</label>
+                <label class="form-label" for="participant-id">实验账号</label>
                 <input
                   class="text-input"
                   id="participant-id"
                   name="participant-id"
                   type="text"
-                  autocomplete="off"
+                  autocomplete="username"
                   maxlength="32"
                   required
-                  placeholder="请输入研究者提供的编号"
+                  placeholder="请输入研究者发放的账号"
                 />
-                <p class="form-hint">请勿填写姓名、学号、手机号或其他身份信息。</p>
+                <p class="form-hint">仅限受邀参与者使用，不需要手机号注册。</p>
               </div>
+              <div class="form-field">
+                <label class="form-label" for="login-password">密码</label>
+                <input class="text-input" id="login-password" type="password" autocomplete="current-password" maxlength="128" required placeholder="请输入账号对应的密码" />
+              </div>
+              <p class="error-note" id="login-error"></p>
+              <p class="status-note" id="login-status" role="status"></p>
               <div class="button-row">
                 <button class="button button--primary button--wide" type="submit">
-                  开始实验
+                  登录并继续
                 </button>
               </div>
-              <p class="tiny-note">点击后将先进入知情同意页面，正式开始前仍可决定不参加。</p>
+              <p class="tiny-note">登录后可查看自己的任务记录，并自主选择是否开始本次任务。</p>
             </form>
           </div>
         </section>
@@ -357,7 +457,7 @@
       { home: true, hideProgress: true, participant: false },
     );
 
-    document.getElementById("start-form").addEventListener("submit", (event) => {
+    document.getElementById("start-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const input = document.getElementById("participant-id");
       const participantId = input.value.trim();
@@ -365,22 +465,169 @@
         input.focus();
         return;
       }
-      state.participantId = participantId;
-      navigate("consent");
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      const password = document.getElementById("login-password");
+      document.getElementById("login-status").classList.remove("is-visible");
+      button.disabled = true;
+      try {
+        const result = await apiRequest(config.ENDPOINTS.login, { username: participantId, password: password.value });
+        password.value = "";
+        authToken = result.token;
+        resetParticipant(result.participantId, result.username || result.participantId);
+        try { window.localStorage.setItem(AUTH_KEY, JSON.stringify(result)); } catch (_) {}
+        enterAuthenticated();
+      } catch (error) {
+        password.value = "";
+        button.disabled = false;
+        showError(error.message || "暂时无法登录，请稍后重试。", "login-error");
+      }
     });
   }
 
+  async function renderDashboard() {
+    const dashboardPid = state.participantId;
+    const dashboardToken = authToken;
+    state.roundId = null;
+    renderShell(`<section class="card"><div class="card__body"><h2>我的文字任务</h2><p id="rounds-summary">正在读取任务记录…</p><div id="rounds-actions"></div><p class="error-note" id="rounds-error"></p></div></section>
+      <section class="card password-card"><div class="card__body">
+        <h3>账号设置</h3>
+        <button class="button button--secondary" type="button" id="show-password-form" aria-expanded="false" aria-controls="password-form">修改密码</button>
+        <form id="password-form" hidden>
+          <p class="form-hint">修改后需要重新登录。忘记原密码时，请联系研究者协助处理。</p>
+          <div class="form-field"><label class="form-label" for="current-password">原密码</label><input class="text-input" id="current-password" type="password" autocomplete="current-password" maxlength="128" required /></div>
+          <div class="form-field"><label class="form-label" for="new-password">新密码</label><input class="text-input" id="new-password" type="password" autocomplete="new-password" minlength="15" maxlength="128" aria-describedby="password-hint" required /><p class="form-hint" id="password-hint">15至128个字符，可以使用便于记忆的长句。请与其他网站的密码区分。</p></div>
+          <div class="form-field"><label class="form-label" for="confirm-password">再次输入新密码</label><input class="text-input" id="confirm-password" type="password" autocomplete="new-password" maxlength="128" required /></div>
+          <p class="error-note" id="password-error"></p>
+          <div class="button-row"><button class="button button--primary" type="submit">确认修改密码</button><button class="button button--ghost" id="cancel-password" type="button">取消</button></div>
+        </form>
+      </div></section>`, { hideProgress: true });
+    bindPasswordForm(dashboardPid, dashboardToken);
+    try {
+      const data = await apiRequest(config.ENDPOINTS.rounds);
+      if (state.currentScreen !== "dashboard" || state.participantId !== dashboardPid || authToken !== dashboardToken) return;
+      const rounds = data.rounds;
+      const active = rounds.find((r) => r.status === "active");
+      const last = rounds.at(-1);
+      const completed = rounds.filter((r) => r.status === "complete").length;
+      document.getElementById("rounds-summary").textContent = `你已完成 ${completed} 次任务。未完成的任务可以继续；新的任务需要由你主动开始。`;
+      const actions = document.getElementById("rounds-actions");
+      const history = document.createElement("ul");
+      const labels = { active: "进行中", complete: "已完成", withdrawn: "已退出", support_requested: "请联系研究者" };
+      for (const r of rounds.slice(-8)) {
+        const item = document.createElement("li");
+        item.textContent = `第 ${r.round_id} 次 · ${labels[r.status] || r.status}`;
+        history.append(item);
+      }
+      actions.append(history);
+      if (!active && last?.status === "support_requested") {
+        document.getElementById("rounds-summary").textContent = "请先联系现场研究者，暂不开始新一轮任务。";
+        return;
+      }
+      const button = document.createElement("button");
+      button.className = "button button--primary";
+      button.type = "button";
+      button.textContent = active ? `继续第 ${active.round_id} 次任务` : `开始第 ${rounds.length + 1} 次任务`;
+      button.onclick = async () => {
+        button.disabled = true;
+        try {
+          const result = await apiRequest(config.ENDPOINTS.startRound, {});
+          if (state.participantId !== dashboardPid || authToken !== dashboardToken) return;
+          if (result.consentVersion !== config.CONSENT_VERSION) throw new Error("研究说明版本正在更新，请刷新页面或联系研究者，暂不开始任务。");
+          resetParticipant(dashboardPid, state.accountName);
+          state.roundId = result.round.round_id;
+          state.consentVersion = result.consentVersion;
+          state.consentReusable = Boolean(result.round.can_reaffirm);
+          state.roundConsented = Boolean(result.round.consent?.accepted && result.round.consent.version === result.consentVersion);
+          recoverySnapshot = loadSession();
+          if (recoverySnapshot) renderRecovery();
+          else navigate(state.roundConsented ? "event" : "consent");
+        } catch (error) {
+          button.disabled = false;
+          showError(error.message, "rounds-error");
+        }
+      };
+      actions.append(button);
+    } catch (error) {
+      if (state.participantId === dashboardPid && authToken === dashboardToken) showError(error.message, "rounds-error");
+    }
+  }
+
+  function bindPasswordForm(participantId, token) {
+    const form = document.getElementById("password-form");
+    const toggle = document.getElementById("show-password-form");
+    const current = document.getElementById("current-password");
+    const next = document.getElementById("new-password");
+    const confirm = document.getElementById("confirm-password");
+    const errorNote = document.getElementById("password-error");
+    const actions = document.getElementById("rounds-actions");
+    toggle.onclick = () => {
+      form.hidden = false;
+      toggle.hidden = true;
+      toggle.setAttribute("aria-expanded", "true");
+      current.focus();
+    };
+    document.getElementById("cancel-password").onclick = () => {
+      form.reset();
+      errorNote.textContent = "";
+      errorNote.classList.remove("is-visible");
+      form.hidden = true;
+      toggle.hidden = false;
+      toggle.setAttribute("aria-expanded", "false");
+      toggle.focus();
+    };
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      errorNote.classList.remove("is-visible");
+      if ([...next.value].length < 15 || [...next.value].length > 128 || !next.value.trim()) {
+        showError("新密码需为15至128个字符，不能全部为空格。", "password-error");
+        next.focus();
+        return;
+      }
+      if (next.value !== confirm.value) {
+        showError("两次输入的新密码不一致，请重新确认。", "password-error");
+        confirm.focus();
+        return;
+      }
+      const controls = form.querySelectorAll("input, button");
+      controls.forEach((control) => { control.disabled = true; });
+      actions.inert = true;
+      try {
+        await apiRequest(config.ENDPOINTS.changePassword, { currentPassword: current.value, newPassword: next.value, confirmPassword: confirm.value });
+        form.reset();
+        if (authToken !== token || state.participantId !== participantId) return;
+        requireLogin();
+        document.getElementById("login-error").classList.remove("is-visible");
+        const status = document.getElementById("login-status");
+        status.textContent = "密码已修改，请使用新密码重新登录。原有任务记录会继续保留。";
+        status.classList.add("is-visible");
+        document.getElementById("participant-id").value = state.accountName;
+        document.getElementById("login-password").focus();
+      } catch (error) {
+        if (authToken === token && state.participantId === participantId && state.currentScreen === "dashboard") {
+          current.value = "";
+          showError(error.message || "暂时无法修改密码，请稍后重试。", "password-error");
+          current.focus();
+        }
+      } finally {
+        controls.forEach((control) => { control.disabled = false; });
+        actions.inert = false;
+      }
+    };
+  }
+
   function renderConsent() {
+    const brief = state.consentReusable;
     renderShell(`
       <div class="page-title">
         <p class="eyebrow">第一步</p>
-        <h2>实验知情同意书</h2>
-        <p class="lead">请完整阅读以下内容。若有疑问，可以在决定前询问研究人员。</p>
+        <h2 id="consent-page-heading">${brief ? "本次参与确认" : "实验知情同意书"}</h2>
+        <p class="lead">${brief ? "本次仍为约12分钟的文字任务，使用与你上次确认相同版本的说明。你可以再次查看全文，并自主决定是否参加本次任务；随时可以停止。" : "请完整阅读以下内容。若有疑问，可以在决定前询问研究人员。"}</p>
+        ${brief ? '<button class="button button--secondary" type="button" id="view-consent">查看完整知情同意书</button>' : ''}
       </div>
       <div class="page-grid page-grid--wide">
-        <section class="card" aria-labelledby="consent-title">
+        <section class="card" aria-labelledby="consent-page-heading">
           <div class="card__body">
-            <div class="consent-document" id="consent-document" tabindex="0">
+            <div class="consent-document" id="consent-document" tabindex="0" ${brief ? "hidden" : ""}>
               <p>尊敬的参与者：</p>
               <p>您好！感谢您关注并考虑参加本研究。在您决定是否参加之前，请仔细阅读以下内容。研究人员将向您说明本研究的目的、流程、可能的风险与收益、数据处理方式以及您的相关权利。若您对任何内容存在疑问，可在决定是否参加前向研究人员提出。</p>
               <p>请您在充分理解本说明并自愿同意后参加本研究。</p>
@@ -422,11 +669,12 @@
 
             <form class="consent-confirm" id="consent-form">
               <h3>知情同意确认</h3>
+              <p class="error-note" id="consent-error"></p>
               <label class="choice">
                 <input type="radio" name="consent" value="agree" required />
                 <span>
-                  <strong>我自愿同意参加</strong>
-                  <span>我已年满18周岁，已阅读并理解以上内容，自愿同意参加本研究。</span>
+                  <strong>${brief ? "我自愿参加本次任务" : "我自愿同意参加"}</strong>
+                  <span>${brief ? "我已阅读过同版本的完整说明，了解本次流程，并知道可以随时停止。" : "我已年满18周岁，已阅读并理解以上内容，自愿同意参加本研究。"}</span>
                 </span>
               </label>
               <label class="choice">
@@ -450,10 +698,25 @@
       </div>
     `);
 
-    document.getElementById("consent-form").addEventListener("submit", (event) => {
+    document.getElementById("view-consent")?.addEventListener("click", (event) => {
+      document.getElementById("consent-document").hidden = false;
+      event.currentTarget.hidden = true;
+    });
+    document.getElementById("consent-form").addEventListener("submit", async (event) => {
       event.preventDefault();
       const selected = new FormData(event.currentTarget).get("consent");
-      navigate(selected === "agree" ? "event" : "withdrawn");
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        if (!state.previewMode) await apiRequest(config.ENDPOINTS.consent, { participantId: state.participantId, accepted: selected === "agree", version: state.consentVersion });
+        state.roundConsented = selected === "agree";
+        const next = state.resumeAfterConsent || "event";
+        state.resumeAfterConsent = null;
+        navigate(selected === "agree" ? next : "withdrawn");
+      } catch (error) {
+        button.disabled = false;
+        showError(error.message, "consent-error");
+      }
     });
   }
 
@@ -715,7 +978,7 @@
   async function assignCondition() {
     try {
       let condition;
-      if (isLocalPreview()) {
+      if (state.previewMode && isLocalPreview()) {
         if (config.ASSIGNMENT_MODE === "pilot_ai") condition = "ai";
         else {
           const randomValue = new Uint32Array(1);
@@ -972,13 +1235,15 @@
   }
 
   async function streamChatRequest(endpoint, payload, onDelta, signal) {
+    const requestToken = authToken;
     const response = await fetch(apiUrl(endpoint), {
-      method: "POST", headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      method: "POST", headers: { ...requestHeaders(), "Accept": "text/event-stream" },
       body: JSON.stringify(payload), signal,
     });
     if (!response.ok) {
       let detail;
       try { detail = (await response.json()).error; } catch (_) {}
+      if (response.status === 401 && requestToken === authToken) requireLogin();
       const error = new Error(detail?.message || `请求失败 ${response.status}`);
       error.requestId = response.headers.get("X-Request-ID");
       throw error;
@@ -1067,10 +1332,12 @@
     let streamedText = "";
     const controller = new AbortController();
     state.chatController = controller;
+    const requestRound = state.roundId, requestPid = state.participantId;
+    const isCurrentRequest = () => state.chatController === controller && state.roundId === requestRound && state.participantId === requestPid;
     const timeout = window.setTimeout(() => controller.abort(), 210000);
     try {
       const start = state.pendingChat.start;
-      const payload = { participantId: state.participantId, event: state.event, secondsRemaining: remainingSeconds() };
+      const payload = { participantId: state.participantId, roundId: state.roundId, event: state.event, secondsRemaining: remainingSeconds() };
       if (!start) {
         payload.messages = state.messages.slice(-30);
         payload.turnNumber = state.pendingChat.turnNumber;
@@ -1079,7 +1346,7 @@
         start ? config.ENDPOINTS.chatStartStream : config.ENDPOINTS.chatReplyStream,
         payload,
         (delta) => {
-          if (state.currentScreen !== "chat" || state.taskExpired) return;
+          if (!isCurrentRequest() || state.currentScreen !== "chat" || state.taskExpired) return;
           if (state.taskDeadline !== null && remainingSeconds() === 0) { expireTask(); return; }
           const body = document.getElementById("chat-body");
           const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 90;
@@ -1089,7 +1356,7 @@
         },
         controller.signal,
       );
-      if (state.currentScreen !== "chat" || state.taskExpired) return;
+      if (!isCurrentRequest() || state.currentScreen !== "chat" || state.taskExpired) return;
       if (state.taskDeadline !== null && remainingSeconds() === 0) { expireTask(); return; }
       message.removeAttribute("id");
       message.querySelector(".message__bubble").textContent = result.reply;
@@ -1111,15 +1378,17 @@
         note.textContent = state.taskExpired ? "任务到时，回复已暂停" : "回复未完整生成";
         message.append(note);
       }
-      if (state.currentScreen !== "chat" || state.taskExpired) return;
+      if (!isCurrentRequest() || state.currentScreen !== "chat" || state.taskExpired) return;
       const reference = error.requestId ? `（错误编号 ${error.requestId}）` : "";
       showError(`这条回复未能完成。你的输入已保留，点击“重试这条消息”即可，无需重复输入。${reference}`, "chat-error");
       retry.hidden = false;
     } finally {
       window.clearTimeout(timeout);
-      if (state.chatController === controller) state.chatController = null;
-      state.chatBusy = false;
-      if (state.currentScreen === "chat") setChatEnabled(true);
+      if (isCurrentRequest()) {
+        state.chatController = null;
+        state.chatBusy = false;
+        if (state.currentScreen === "chat") setChatEnabled(true);
+      }
     }
   }
 
@@ -1443,7 +1712,22 @@
     const original = button.textContent;
     button.disabled = true;
     button.textContent = "正在保存…";
-    try { await submitCompletion(status); button.textContent = label; }
+    try {
+      await submitCompletion(status);
+      button.textContent = label;
+      if (!document.getElementById("account-dashboard")) {
+        const dashboard = document.createElement("button");
+        dashboard.id = "account-dashboard";
+        dashboard.className = "button button--secondary";
+        dashboard.type = "button";
+        dashboard.textContent = "返回账号主页";
+        dashboard.onclick = () => {
+          state.currentScreen = "dashboard";
+          renderDashboard();
+        };
+        button.parentElement.append(dashboard);
+      }
+    }
     catch (_) {
       button.disabled = false;
       button.textContent = original;
@@ -1526,6 +1810,9 @@
 
   function renderCurrentScreen() {
     switch (state.currentScreen) {
+      case "dashboard":
+        renderDashboard();
+        break;
       case "home":
         renderHome();
         break;
@@ -1576,7 +1863,5 @@
   }
 
   bindDialog();
-  if (!applyPreviewRoute()) recoverySnapshot = loadSession();
-  if (recoverySnapshot) renderRecovery();
-  else renderCurrentScreen();
+  boot();
 })();
