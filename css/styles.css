@@ -676,11 +676,32 @@ h3 {
   margin-top: 1.25rem;
 }
 
+.password-card .card__body,
+#rounds-actions {
+  display: grid;
+  justify-items: start;
+  gap: 1.25rem;
+}
+
+#rounds-actions > ul {
+  margin: 0;
+}
+
+#rounds-actions > ul:empty {
+  display: none;
+}
+
 #password-form {
+  width: 100%;
   max-width: 36rem;
 }
 
+#password-form > .form-hint {
+  margin-bottom: 1.25rem;
+}
+
 .admin-group-choice {
+  width: 100%;
   max-width: 30rem;
 }
 
